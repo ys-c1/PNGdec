@@ -56,6 +56,272 @@ static const uint16_t usGrayTo565[] = {0x0000,0x0000,0x0000,0x0000,0x0020,0x0020
     0xf79e,0xf79e,0xf79e,0xf79e,0xf7be,0xf7be,0xf7be,0xf7be,
     0xffdf,0xffdf,0xffdf,0xffdf,0xffff,0xffff,0xffff,0xffff};
 
+//===========================================================================
+// Optional decode-time linearization (sRGB / gAMA -> linear light)
+//
+// Enabled through new decode() option bits (existing option bits and the
+// default decode path are untouched; no public function signature changes):
+//   PNG_LIN_ENABLE (0x04) turn on profile detection + linearization
+//   PNG_LIN_PREMULT(0x08) premultiply alpha in linear space
+//   PNG_LIN_16BIT  (0x10) use a 16-bit LUT and widen channels to uint16
+//
+// Three stages, in this order:
+//   1. profile detection from the file's own sRGB / gAMA markers
+//      sRGB present            -> standard sRGB transfer function
+//      only gAMA present       -> power law with exponent 1/gamma
+//      neither                 -> untagged, pixels are passed through
+//      sRGB + gAMA together    -> conflict; sRGB wins, gAMA is ignored
+//                                 (matches the PNG spec's preference order)
+//   2. table-driven sRGB->linear conversion (LUT, reversible)
+//   3. optional alpha premultiply, performed in linear space
+//
+// All math is self-contained double arithmetic (no libm, no malloc).
+//===========================================================================
+#ifndef PNG_LIN_ENABLE
+#define PNG_LIN_ENABLE  0x04
+#define PNG_LIN_PREMULT 0x08
+#define PNG_LIN_16BIT   0x10
+#endif
+// status bits returned by PNG_linearStatus()
+#define PNG_LIN_ST_ON        0x01 // option enabled for this decode
+#define PNG_LIN_ST_ACTIVE    0x02 // a profile was found, conversion applied
+#define PNG_LIN_ST_SRGB      0x04 // file carries an sRGB chunk
+#define PNG_LIN_ST_GAMA      0x08 // file carries a gAMA chunk
+#define PNG_LIN_ST_CONFLICT  0x10 // both present; sRGB took priority
+#define PNG_LIN_ST_PREMULT   0x20
+#define PNG_LIN_ST_16BIT     0x40
+#define PNG_LIN_ST_BAD_GAMA  0x80 // gAMA value was 0/invalid, ignored
+
+typedef struct png_lin_tag
+{
+    int bEnabled, bPremult, b16;
+    int bSRGB, bGAMA, bBadGamma;
+    int bActive, bReady;
+    uint32_t u32Gamma; // raw gAMA chunk value (gamma * 100000)
+    uint8_t ucLUT8[256];    // 8-bit precision forward LUT (256 bytes)
+    uint16_t usLUT16[256];  // 16-bit precision forward LUT (512 bytes)
+} PNG_LIN_STATE;
+static PNG_LIN_STATE g_pngLin; // single decoder instance, reset every decode()
+
+// --- self-contained real math (no libm) ---------------------------------
+// Natural log via range reduction to m in [1/sqrt2, sqrt2) followed by
+// the atanh series: ln(m) = 2*sum(t^(2n+1)/(2n+1)), t=(m-1)/(m+1).
+// With |t| <= ~0.172 and 18 terms, truncation is below 1e-20.
+PNG_STATIC double lin_log(double x)
+{
+    int k = 0;
+    const double LN2 = 0.6931471805599453;
+    const double SQRT2_HI = 1.4142135623730951;
+    const double SQRT2_LO = 0.7071067811865476;
+    while (x < SQRT2_LO) { x *= 2.0; k--; }
+    while (x >= SQRT2_HI) { x *= 0.5; k++; }
+    double t = (x - 1.0) / (x + 1.0);
+    double t2 = t * t, term = t, s = t;
+    for (int i = 1; i < 18; i++) { term *= t2; s += term / (2*i + 1); }
+    return 2.0 * s + (double)k * LN2;
+}
+// exp via reduction to |r| <= ln(2)/2 and a 16-term Taylor series.
+PNG_STATIC double lin_exp(double x)
+{
+    const double LN2 = 0.6931471805599453;
+    double q = x / LN2;
+    long k = (long)(q >= 0.0 ? q + 0.5 : q - 0.5);
+    double r = x - (double)k * LN2;
+    double e = 1.0, term = 1.0;
+    for (int i = 1; i < 16; i++) { term *= r / i; e += term; }
+    double p2 = 1.0; // 2^k without ldexp()
+    if (k >= 0) { long i; for (i = 0; i < k; i++) p2 *= 2.0; }
+    else       { long i; for (i = 0; i < -k; i++) p2 *= 0.5; }
+    return e * p2;
+}
+PNG_STATIC double lin_pow(double x, double e)
+{
+    if (x <= 0.0) return 0.0;
+    return lin_exp(e * lin_log(x));
+}
+// exact forward transfer function for the detected profile, normalized 0..1
+PNG_STATIC double lin_forward(double u)
+{
+    if (g_pngLin.bSRGB) {
+        if (u <= 0.04045) return u / 12.92;
+        return lin_pow((u + 0.055) / 1.055, 2.4);
+    }
+    double gamma = (double)g_pngLin.u32Gamma / 100000.0;
+    return lin_pow(u, 1.0 / gamma);
+}
+// exact inverse transfer function, normalized 0..1
+PNG_STATIC double lin_inverse(double l)
+{
+    if (g_pngLin.bSRGB) {
+        if (l <= 0.0031308) return l * 12.92;
+        return 1.055 * lin_pow(l, 1.0 / 2.4) - 0.055;
+    }
+    double gamma = (double)g_pngLin.u32Gamma / 100000.0;
+    return lin_pow(l, gamma);
+}
+// Called once, after all pre-IDAT chunks (sRGB/gAMA) have been seen
+PNG_STATIC void lin_ensure(PNGIMAGE *pPage)
+{
+    int i;
+    if (g_pngLin.bReady) return;
+    g_pngLin.bReady = 1;
+    g_pngLin.bActive = g_pngLin.bSRGB ||
+                       (g_pngLin.bGAMA && g_pngLin.u32Gamma != 0);
+    if (!g_pngLin.bActive) return; // untagged (or bad gAMA only): passthrough
+    for (i = 0; i < 256; i++) {
+        double l = lin_forward((double)i / 255.0);
+        double v8  = l * 255.0 + 0.5;
+        double v16 = l * 65535.0 + 0.5;
+        g_pngLin.ucLUT8[i]  = (uint8_t)(v8 > 255.0 ? 255.0 : v8);
+        g_pngLin.usLUT16[i] = (uint16_t)(v16 > 65535.0 ? 65535.0 : v16);
+    }
+    // indexed images: linearize the palette once, pixel indices stay as-is
+    if (pPage->ucPixelType == PNG_PIXEL_INDEXED) {
+        int iColors = 1 << pPage->ucBpp;
+        for (i = 0; i < iColors; i++) {
+            uint8_t *p = &pPage->ucPalette[i * 3];
+            int a = pPage->ucPalette[768 + i];
+            p[0] = g_pngLin.ucLUT8[p[0]];
+            p[1] = g_pngLin.ucLUT8[p[1]];
+            p[2] = g_pngLin.ucLUT8[p[2]];
+            if (g_pngLin.bPremult) {
+                p[0] = (uint8_t)((p[0] * a + 127) / 255);
+                p[1] = (uint8_t)((p[1] * a + 127) / 255);
+                p[2] = (uint8_t)((p[2] * a + 127) / 255);
+            }
+        }
+    }
+}
+// 8-bit precision: in-place line transform, same pitch/stride as decode
+PNG_STATIC void lin_line8(PNGIMAGE *pPage, uint8_t *p)
+{
+    int x, i;
+    if (pPage->ucPixelType == PNG_PIXEL_INDEXED) return; // palette already done
+    switch (pPage->ucPixelType) {
+        case PNG_PIXEL_TRUECOLOR:
+            for (x = 0; x < pPage->iWidth; x++, p += 3)
+                for (i = 0; i < 3; i++) p[i] = g_pngLin.ucLUT8[p[i]];
+            break;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            for (x = 0; x < pPage->iWidth; x++, p += 4) {
+                p[0] = g_pngLin.ucLUT8[p[0]];
+                p[1] = g_pngLin.ucLUT8[p[1]];
+                p[2] = g_pngLin.ucLUT8[p[2]];
+                if (g_pngLin.bPremult) {
+                    int a = p[3]; // alpha is never linearized
+                    p[0] = (uint8_t)((p[0] * a + 127) / 255);
+                    p[1] = (uint8_t)((p[1] * a + 127) / 255);
+                    p[2] = (uint8_t)((p[2] * a + 127) / 255);
+                }
+            }
+            break;
+        case PNG_PIXEL_GRAYSCALE:
+            for (x = 0; x < pPage->iPitch; x++) p[x] = g_pngLin.ucLUT8[p[x]];
+            break;
+        case PNG_PIXEL_GRAY_ALPHA:
+            for (x = 0; x < pPage->iWidth; x++, p += 2) {
+                p[0] = g_pngLin.ucLUT8[p[0]];
+                if (g_pngLin.bPremult)
+                    p[0] = (uint8_t)((p[0] * p[1] + 127) / 255);
+            }
+            break;
+    }
+}
+// 16-bit precision: widen every channel byte to a native-endian uint16.
+// Destination stride is 2 * iPitch; requires a caller buffer of twice
+// getBufferSize() (validated in lin_setup, only used with setBuffer()).
+PNG_STATIC void lin_expand16(PNGIMAGE *pPage, uint8_t *pSrc, uint16_t *pDst)
+{
+    int i, n = pPage->iPitch; // all pitch bytes are channel bytes
+    for (i = 0; i < n; i++) {
+        int isAlpha = 0;
+        if (pPage->ucPixelType == PNG_PIXEL_TRUECOLOR_ALPHA && (i & 3) == 3) isAlpha = 1;
+        if (pPage->ucPixelType == PNG_PIXEL_GRAY_ALPHA && (i & 1) == 1) isAlpha = 1;
+        if (isAlpha) {
+            pDst[i] = (uint16_t)(pSrc[i] * 257); // keep alpha, widen 8->16 bit
+        } else {
+            uint16_t lin = g_pngLin.usLUT16[pSrc[i]];
+            if (g_pngLin.bPremult) {
+                int iAlphaIdx;
+                if (pPage->ucPixelType == PNG_PIXEL_TRUECOLOR_ALPHA)
+                    iAlphaIdx = (i & ~3) + 3;
+                else
+                    iAlphaIdx = (i & ~1) + 1;
+                uint32_t a16 = (uint32_t)pSrc[iAlphaIdx] * 257u;
+                lin = (uint16_t)((lin * a16 + 32768u) / 65535u);
+            }
+            pDst[i] = lin;
+        }
+    }
+}
+PNG_STATIC int lin_setup(PNGIMAGE *pPage, int iOptions)
+{
+    // Reset unconditionally: g_pngLin is global and an earlier decode's
+    // flags (e.g. b16/bEnabled) must never leak into a plain decode.
+    memset(&g_pngLin, 0, sizeof(g_pngLin));
+    if (!(iOptions & PNG_LIN_ENABLE)) return PNG_SUCCESS;
+    g_pngLin.bEnabled = 1;
+    g_pngLin.bPremult = (iOptions & PNG_LIN_PREMULT) ? 1 : 0;
+    g_pngLin.b16 = (iOptions & PNG_LIN_16BIT) ? 1 : 0;
+    if (g_pngLin.b16) {
+        if (pPage->pImage == NULL) { // callback path cannot hold widened output
+            pPage->iError = PNG_INVALID_PARAMETER;
+            return pPage->iError;
+        }
+        if (pPage->ucPixelType == PNG_PIXEL_INDEXED ||
+            (pPage->ucPixelType == PNG_PIXEL_GRAYSCALE && pPage->ucBpp < 8)) {
+            pPage->iError = PNG_UNSUPPORTED_FEATURE;
+            return pPage->iError;
+        }
+    } else if (pPage->ucPixelType == PNG_PIXEL_GRAYSCALE && pPage->ucBpp < 8) {
+        pPage->iError = PNG_UNSUPPORTED_FEATURE; // packed sub-byte gray, no LUT slots
+        return pPage->iError;
+    }
+    return PNG_SUCCESS;
+}
+// Diagnostic / inverse helpers for callers and tests. Additive free
+// functions; no existing public signature is changed.
+#ifdef __cplusplus
+extern "C" {
+#endif
+int PNG_linearStatus(void)
+{
+    int s = 0;
+    if (g_pngLin.bEnabled) s |= PNG_LIN_ST_ON;
+    if (g_pngLin.bActive)  s |= PNG_LIN_ST_ACTIVE;
+    if (g_pngLin.bSRGB)    s |= PNG_LIN_ST_SRGB;
+    if (g_pngLin.bGAMA)    s |= PNG_LIN_ST_GAMA;
+    if (g_pngLin.bSRGB && g_pngLin.bGAMA) s |= PNG_LIN_ST_CONFLICT;
+    if (g_pngLin.bPremult) s |= PNG_LIN_ST_PREMULT;
+    if (g_pngLin.b16)      s |= PNG_LIN_ST_16BIT;
+    if (g_pngLin.bBadGamma) s |= PNG_LIN_ST_BAD_GAMA;
+    return s;
+}
+// size of the static linearization state (diagnostic/memory accounting)
+int PNG_linearStateSize(void)
+{
+    return (int)sizeof(PNG_LIN_STATE);
+}
+// Map an 8-bit linear value back to the profile's encoded 8-bit value
+uint8_t PNG_linearInv8(uint8_t ucLinear)
+{
+    if (!g_pngLin.bActive) return ucLinear;
+    double v = lin_inverse((double)ucLinear / 255.0) * 255.0 + 0.5;
+    if (v < 0.0) v = 0.0; else if (v > 255.0) v = 255.0;
+    return (uint8_t)v;
+}
+// Map a 16-bit linear value back to the profile's encoded 8-bit value
+uint8_t PNG_linearInv16(uint16_t usLinear)
+{
+    if (!g_pngLin.bActive) return (uint8_t)((usLinear + 128) / 257);
+    double v = lin_inverse((double)usLinear / 65535.0) * 255.0 + 0.5;
+    if (v < 0.0) v = 0.0; else if (v > 255.0) v = 255.0;
+    return (uint8_t)v;
+}
+#ifdef __cplusplus
+}
+#endif
+
 //
 // C interface
 //
@@ -822,6 +1088,10 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
         pPage->iError = PNG_NO_BUFFER;
         return 0;
     }
+    // Optional linearization: detect profile from sRGB/gAMA markers and
+    // prepare the LUT state. The plain decode path is untouched when off.
+    if (lin_setup(pPage, iOptions) != PNG_SUCCESS)
+        return pPage->iError;
     // Use internal buffer to maintain the current and previous lines
     y = (int)(intptr_t)&pPage->ucPixels[0];
     y &= 15; // make sure we're 16-byte aligned, -1 for filter byte
@@ -888,6 +1158,16 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
             case 0x44474b62: // 'bKGD' DEBUG
                 break;
             case 0x67414d41: //'gAMA'
+                // remember the profile for optional linearization;
+                // if sRGB is also present it takes priority (see lin_ensure)
+                if (g_pngLin.bEnabled && iLen == 4 && iAvailable >= 4) {
+                    g_pngLin.bGAMA = 1;
+                    g_pngLin.u32Gamma = (uint32_t)MOTOLONG(&s[iOffset]);
+                    if (g_pngLin.u32Gamma == 0) g_pngLin.bBadGamma = 1;
+                }
+                break;
+            case 0x73524742: //'sRGB'
+                if (g_pngLin.bEnabled) g_pngLin.bSRGB = 1;
                 break;
 #ifdef FUTURE
             case 0x6663544C: //'fcTL' frame control block for animated PNG (need to get size of this partial image)
@@ -972,6 +1252,17 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
                         if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
                             DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
+                            if (g_pngLin.bEnabled) { // linearization stage 2+3
+                                lin_ensure(pPage);
+                                if (g_pngLin.bActive) {
+                                    if (g_pngLin.b16) { // widen into the caller buffer
+                                        lin_expand16(pPage, pCurr + 1,
+                                            (uint16_t *)&pPage->pImage[y * pPage->iPitch * 2]);
+                                    } else if (pPage->pImage == NULL) {
+                                        lin_line8(pPage, pCurr + 1); // callback gets linear line
+                                    } // buffered 8-bit path transforms the copied line below
+                                }
+                            }
                             if (pPage->pImage == NULL) { // no image buffer, send it line by line
                                 PNGDRAW pngd;
                                 pngd.pUser = pUser;
@@ -988,9 +1279,15 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                                     pPage->iError = PNG_QUIT_EARLY;
                                     bDone = TRUE;
                                 }
+                            } else if (g_pngLin.bEnabled && g_pngLin.bActive &&
+                                       g_pngLin.b16) {
+                                // 16-bit path: line already widened directly
+                                // into pImage above; do not overwrite it
                             } else {
                                 // copy to destination bitmap
                                 memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
+                                if (g_pngLin.bEnabled && g_pngLin.bActive)
+                                    lin_line8(pPage, &pPage->pImage[y * pPage->iPitch]);
                             }
                             y++;
                         // swap current and previous lines
