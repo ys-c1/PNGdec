@@ -144,6 +144,108 @@ typedef int (PNG_DRAW_CALLBACK)(PNGDRAW *);
 typedef void (PNG_CLOSE_CALLBACK)(void *pHandle);
 
 //
+// GPU-friendly stride output
+// --------------------------
+// The normal one-shot output (setBuffer() + decode()) stores tightly packed
+// rows of iPitch bytes. Graphics hardware generally needs a fixed byte
+// stride per row, end-of-row padding to an alignment boundary and sometimes
+// a vertically flipped row order. PNGStrideConfig describes such a
+// destination and PNGStride_draw() is a ready-to-use line callback: every
+// de-filtered line is written directly into the caller-owned buffer at the
+// configured stride, so no separate full-image copy is needed. The decoder
+// itself allocates no extra memory for this feature; the config lives in
+// caller memory and is passed through decode()'s pUser pointer.
+//
+// Example:
+//   PNGStrideConfig cfg;
+//   memset(&cfg, 0, sizeof(cfg));
+//   cfg.pBuffer = myBuffer; // caller guarantees the hardware alignment
+//   cfg.iHeight  = png.getHeight();
+//   cfg.iStride  = PNGStride_align(lineBytes, 256); // 256-byte rows
+//   cfg.bFlipV   = 1;     // optional: bottom-up row order (GPU textures)
+//   cfg.bFillPad = 1;     // optional: fill row padding with ucPad
+//   png.openRAM(pngData, dataSize, PNGStride_draw);
+//   png.decode(&cfg, 0);  // pUser carries the config
+//
+typedef struct png_stride_config_tag
+{
+    uint8_t *pBuffer; // caller-owned destination buffer
+    int iStride;      // bytes between the start of two consecutive rows
+    int iHeight;      // number of rows available in pBuffer
+    int bFlipV;       // non-zero = store rows bottom-up
+    int bFillPad;     // non-zero = fill bytes past the image row with ucPad
+    uint8_t ucPad;    // fill value used when bFillPad is non-zero
+    int iLineBytes;   // output: compact source line width in bytes
+    int iError;       // output: PNG_SUCCESS or a PNG_* error code
+} PNGStrideConfig;
+
+// Round a byte count up to the given alignment (any positive value)
+static inline int PNGStride_align(int iByteCount, int iAlignment)
+{
+    if (iAlignment <= 1 || iByteCount <= 0)
+        return iByteCount;
+    return ((iByteCount + iAlignment - 1) / iAlignment) * iAlignment;
+} /* PNGStride_align() */
+
+// Total destination buffer size required by the configuration
+static inline int PNGStride_requiredSize(const PNGStrideConfig *pCfg)
+{
+    if (pCfg == NULL || pCfg->iStride <= 0 || pCfg->iHeight <= 0)
+        return 0;
+    return pCfg->iStride * pCfg->iHeight;
+} /* PNGStride_requiredSize() */
+
+// Check the configuration against the image geometry.
+// iLineBytes is the compact decoder pitch (getBufferSize()/getHeight())
+static inline int PNGStride_validate(PNGStrideConfig *pCfg, int iWidth,
+                                     int iHeight, int iLineBytes)
+{
+    if (pCfg == NULL)
+        return PNG_INVALID_PARAMETER;
+    pCfg->iError = PNG_SUCCESS;
+    if (pCfg->pBuffer == NULL || iWidth <= 0 || iHeight <= 0 ||
+        iLineBytes <= 0 || pCfg->iStride <= 0 || pCfg->iHeight <= 0 ||
+        pCfg->iStride < iLineBytes || pCfg->iHeight < iHeight) {
+        pCfg->iError = PNG_INVALID_PARAMETER;
+    } else {
+        pCfg->iLineBytes = iLineBytes;
+    }
+    return pCfg->iError;
+} /* PNGStride_validate() */
+
+// Line callback for open()/openRAM()/openFLASH(). Pass a PNGStrideConfig
+// pointer as the pUser argument of decode(). Returning 0 stops the decode
+// with PNG_QUIT_EARLY and records the real cause in pCfg->iError.
+static inline int PNGStride_draw(PNGDRAW *pDraw)
+{
+    PNGStrideConfig *pCfg = (PNGStrideConfig *)pDraw->pUser;
+    uint8_t *pDest;
+    int iRow;
+
+    if (pCfg == NULL || pCfg->pBuffer == NULL)
+        return 0; // nothing to write into - stop the decode
+    if (pDraw->iPitch <= 0 || pCfg->iStride < pDraw->iPitch) {
+        pCfg->iError = PNG_INVALID_PARAMETER; // stride smaller than row width
+        return 0;
+    }
+    iRow = pCfg->bFlipV ? (pCfg->iHeight - 1 - pDraw->y) : pDraw->y;
+    if (iRow < 0 || iRow >= pCfg->iHeight) {
+        pCfg->iError = PNG_INVALID_PARAMETER;
+        return 0;
+    }
+    pDest = pCfg->pBuffer + (intptr_t)iRow * pCfg->iStride;
+    memcpy(pDest, pDraw->pPixels, pDraw->iPitch);
+    if (pCfg->bFillPad && pCfg->iStride > pDraw->iPitch)
+        memset(pDest + pDraw->iPitch, pCfg->ucPad,
+               (size_t)(pCfg->iStride - pDraw->iPitch));
+    if (pDraw->y == 0) {
+        pCfg->iLineBytes = pDraw->iPitch;
+        pCfg->iError = PNG_SUCCESS;
+    }
+    return 1;
+} /* PNGStride_draw() */
+
+//
 // our private structure to hold a JPEG image decode state
 //
 typedef struct png_image_tag
