@@ -1,0 +1,16 @@
+== sample filters_gray8 (9x7 type=0 bpp=8 interlaced=0)
+  (provenance compiled out: PNG_PROVENANCE=0)
+== sample interlace_rgb (9x7 type=2 bpp=8 interlaced=1)
+  (provenance compiled out: PNG_PROVENANCE=0)
+== sample palette8_trns (9x7 type=3 bpp=8 interlaced=0)
+  (provenance compiled out: PNG_PROVENANCE=0)
+== sample alpha_rgba (8x6 type=6 bpp=8 interlaced=0)
+  (provenance compiled out: PNG_PROVENANCE=0)
+== sample interlace_pal2 (9x7 type=3 bpp=2 interlaced=1)
+  (provenance compiled out: PNG_PROVENANCE=0)
+== sample timing_rgba (64x48 type=6 bpp=8 interlaced=0)
+  (provenance compiled out: PNG_PROVENANCE=0)
+  TIMING over 200 iters: plain=25590us (128.0us/decode)
+  MEMORY: no trace state is linked into this build
+
+36 checks, 0 failures

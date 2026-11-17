@@ -1,0 +1,8 @@
+sample=alpha_rgba 8x6 type=6 bpp=8 interlaced=0
+total_pixels=48 transparent=16 dropped=0
+filter[None]=16
+filter[Sub]=8
+filter[Up]=8
+filter[Average]=8
+filter[Paeth]=8
+pass[0]=48

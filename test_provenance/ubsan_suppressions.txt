@@ -1,0 +1,4 @@
+# Pre-existing UBSan alignment reports inside the bundled zlib inflate.c
+# (unaligned uint32_t accesses in the COPY/MATCH fast paths).
+# Unrelated to the provenance work; keep them out of the test output.
+alignment:inflate.c

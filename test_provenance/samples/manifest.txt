@@ -1,0 +1,6 @@
+filters_gray8,9,7,0,8,0
+interlace_rgb,9,7,2,8,1
+palette8_trns,9,7,3,8,0
+alpha_rgba,8,6,6,8,0
+interlace_pal2,9,7,3,2,1
+timing_rgba,64,48,6,8,0

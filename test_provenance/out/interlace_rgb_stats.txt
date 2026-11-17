@@ -1,0 +1,14 @@
+sample=interlace_rgb 9x7 type=2 bpp=8 interlaced=1
+total_pixels=63 transparent=0 dropped=0
+filter[None]=11
+filter[Sub]=14
+filter[Up]=16
+filter[Average]=15
+filter[Paeth]=7
+pass[1]=2
+pass[2]=1
+pass[3]=3
+pass[4]=4
+pass[5]=10
+pass[6]=16
+pass[7]=27

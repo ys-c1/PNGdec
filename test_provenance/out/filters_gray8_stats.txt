@@ -1,0 +1,8 @@
+sample=filters_gray8 9x7 type=0 bpp=8 interlaced=0
+total_pixels=63 transparent=0 dropped=0
+filter[None]=18
+filter[Sub]=18
+filter[Up]=9
+filter[Average]=9
+filter[Paeth]=9
+pass[0]=63

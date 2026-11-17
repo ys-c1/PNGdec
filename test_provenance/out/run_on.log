@@ -1,0 +1,11 @@
+== sample filters_gray8 (9x7 type=0 bpp=8 interlaced=0)
+== sample interlace_rgb (9x7 type=2 bpp=8 interlaced=1)
+== sample palette8_trns (9x7 type=3 bpp=8 interlaced=0)
+== sample alpha_rgba (8x6 type=6 bpp=8 interlaced=0)
+== sample interlace_pal2 (9x7 type=3 bpp=2 interlaced=1)
+== sample timing_rgba (64x48 type=6 bpp=8 interlaced=0)
+  TIMING best of 3 trials, 200 iters each: plain=24828us line_trace=24758us pixel_trace=29261us
+  TIMING per decode:    plain=124.1us line=123.8us pixel=146.3us (line x1.00, pixel x1.18)
+  MEMORY: trace record sizes line=8 pixel=6; full-frame pixel table=18432 bytes for 64x48
+
+147 checks, 0 failures

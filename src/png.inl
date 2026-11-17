@@ -658,10 +658,11 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
         pPage->ucBpp = s[24]; // bits per pixel
         pPage->ucPixelType = s[25]; // pixel type
         pPage->iInterlaced = s[28];
-        if (pPage->iInterlaced || pPage->ucBpp > 8) { // 16-bit pixels are not supported (yet)
+        if (pPage->ucBpp > 8) { // 16-bit pixels are not supported (yet)
             pPage->iError = PNG_UNSUPPORTED_FEATURE;
             return pPage->iError;
         }
+        // Adam7 interlaced images are supported; the passes are expanded in DecodePNG()
         if (pPage->ucPixelType != PNG_PIXEL_GRAYSCALE && pPage->ucPixelType != PNG_PIXEL_TRUECOLOR && pPage->ucPixelType != PNG_PIXEL_INDEXED && pPage->ucPixelType != PNG_PIXEL_GRAY_ALPHA && pPage->ucPixelType != PNG_PIXEL_TRUECOLOR_ALPHA) {
             pPage->iError = PNG_INVALID_FILE;
             return pPage->iError;
@@ -702,11 +703,9 @@ PNG_STATIC void DeFilter(uint8_t *pCurr, uint8_t *pPrev, int iWidth, int iPitch)
 {
     uint8_t ucFilter = *pCurr++;
     int x, iBpp;
-    if (iPitch <= iWidth)
-        iBpp = 1;
-    else
-        iBpp = iPitch / iWidth;
-    
+    // ceil(pitch/width): packed sub-byte depths correctly resolve to 1 byte
+    iBpp = (iPitch + iWidth - 1) / iWidth;
+
     pPrev++; // skip filter of previous line
     switch (ucFilter) { // switch on filter type
         case PNG_FILTER_NONE:
@@ -800,6 +799,331 @@ PNG_STATIC int PNGInit(PNGIMAGE *pPNG)
 {
     return PNGParseInfo(pPNG); // gather info for image
 } /* PNGInit() */
+
+//
+// Adam7 interlace support
+// Each of the 7 passes has a starting pixel and x/y step.
+//
+static const uint8_t u8Adam7StartX[7] = {0, 4, 0, 2, 0, 1, 0};
+static const uint8_t u8Adam7StartY[7] = {0, 0, 4, 0, 2, 0, 1};
+static const uint8_t u8Adam7StepX[7]  = {8, 8, 4, 4, 2, 2, 1};
+static const uint8_t u8Adam7StepY[7]  = {8, 8, 8, 4, 4, 2, 2};
+
+PNG_STATIC int PNGAdam7Dim(int iFull, int iStart, int iStep)
+{
+    if (iFull <= iStart) return 0;
+    return (iFull - iStart + iStep - 1) / iStep;
+} /* PNGAdam7Dim() */
+
+//
+// Bytes per complete pixel (filter byte width); sub-byte depths round up to 1.
+//
+PNG_STATIC int PNGPixelBytes(PNGIMAGE *pPage)
+{
+    int iBpp;
+    switch (pPage->ucPixelType) {
+        case PNG_PIXEL_TRUECOLOR:
+            iBpp = 3;
+            break;
+        case PNG_PIXEL_GRAY_ALPHA:
+            iBpp = 2;
+            break;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            iBpp = 4;
+            break;
+        default: // grayscale and indexed: 1 byte minimum even for packed depths
+            iBpp = 1;
+            break;
+    }
+    return iBpp;
+} /* PNGPixelBytes() */
+
+//
+// Scanline byte count for a given width and the current pixel type/depth.
+// Mirrors the pitch calculation in PNGParseInfo() so Adam7 sub-images
+// get an exact (not linearly scaled) pitch.
+//
+PNG_STATIC int PNGLinePitch(PNGIMAGE *pPage, int iWidth)
+{
+    switch (pPage->ucPixelType) {
+        case PNG_PIXEL_GRAYSCALE:
+        case PNG_PIXEL_INDEXED:
+            return (iWidth * pPage->ucBpp + 7) / 8;
+        case PNG_PIXEL_TRUECOLOR:
+            return ((3 * pPage->ucBpp) * iWidth + 7) / 8;
+        case PNG_PIXEL_GRAY_ALPHA:
+            return ((2 * pPage->ucBpp) * iWidth + 7) / 8;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            return ((4 * pPage->ucBpp) * iWidth + 7) / 8;
+        default:
+            return 0;
+    }
+} /* PNGLinePitch() */
+
+//
+// Scatter one de-filtered Adam7 sub-image line into the full-size output buffer.
+// Sub-byte pixel depths (1/2/4 bpp) are unpacked and re-packed onto the sparse
+// pixel positions; byte-aligned depths are copied one pixel at a time.
+//
+PNG_STATIC void PNGScatterLine(PNGIMAGE *pPage, uint8_t *pSrc, int iPass, int iPassY, int iPassW)
+{
+    int x, iBpp, iStartX, iStepX, iStartY, iStepY, iDstY;
+    uint8_t *pDst;
+
+    iStartX = u8Adam7StartX[iPass];
+    iStepX  = u8Adam7StepX[iPass];
+    iStartY = u8Adam7StartY[iPass];
+    iStepY  = u8Adam7StepY[iPass];
+    iDstY = iStartY + iPassY * iStepY;
+    pDst = &pPage->pImage[iDstY * pPage->iPitch];
+    iBpp = PNGPixelBytes(pPage);
+    if (iBpp > 1) { // byte aligned pixels (grayscale 8+, truecolor, alpha variants)
+        for (x = 0; x < iPassW; x++) {
+            memcpy(&pDst[(iStartX + x * iStepX) * iBpp], &pSrc[x * iBpp], (size_t)iBpp);
+        }
+    } else if (pPage->ucBpp == 8) { // 8-bit grayscale or indexed
+        for (x = 0; x < iPassW; x++) {
+            pDst[iStartX + x * iStepX] = pSrc[x];
+        }
+    } else { // sub-byte pixels: unpack from the sub-image and re-pack at full positions
+        for (x = 0; x < iPassW; x++) {
+            int iDstBit, iDstByte, iShift, iValue;
+            uint8_t ucSrcByte = pSrc[(x * pPage->ucBpp) >> 3];
+            iShift = (8 - pPage->ucBpp) - ((x * pPage->ucBpp) & 7);
+            iValue = (ucSrcByte >> iShift) & ((1 << pPage->ucBpp) - 1);
+            iDstBit = (iStartX + x * iStepX) * pPage->ucBpp;
+            iDstByte = iDstBit >> 3;
+            iShift = 7 - (iDstBit & 7) - (pPage->ucBpp - 1);
+            pDst[iDstByte] = (uint8_t)((pDst[iDstByte] & ~(((1 << pPage->ucBpp) - 1) << iShift)) |
+                                       (iValue << iShift));
+        }
+    }
+} /* PNGScatterLine() */
+
+//
+// Optional decode provenance (debug tracing)
+//
+// Compile-time master switch: define PNG_PROVENANCE=1 to enable.
+// When disabled (the default), every trace call and all trace state is
+// compiled out, so the decoder is bit-for-bit identical in output and cost.
+//
+#ifndef PNG_PROVENANCE
+#define PNG_PROVENANCE 0
+#endif
+#ifndef PNG_TRACE_MAX_PASS
+#define PNG_TRACE_MAX_PASS 7
+#endif
+
+#if PNG_PROVENANCE
+#if defined(__GNUC__)
+#define PNG_TRACE_UNUSED __attribute__((unused))
+#else
+#define PNG_TRACE_UNUSED
+#endif
+
+// Trace granularity selected at runtime
+enum {
+    PNG_TRACE_OFF = 0,   // no tracing (default after open/close)
+    PNG_TRACE_LINE,      // one record per de-filtered scanline
+    PNG_TRACE_PIXEL      // one record per output pixel
+};
+
+typedef struct png_trace_pixel_tag
+{
+    uint8_t ucFilter;    // PNG filter type of the originating scanline (0..4)
+    uint8_t ucPass;      // Adam7 pass 1..7; 0 for non-interlaced images
+    uint8_t ucTransparent; // 1 if the pixel is transparent, 0 otherwise
+    uint8_t ucReserved;
+    uint16_t usSrcRow;   // scanline index inside its Adam7 pass (line number of the sub-image)
+} PNGTRACEPIXEL;
+
+typedef struct png_trace_line_tag
+{
+    uint8_t ucFilter;
+    uint8_t ucPass;
+    uint16_t usSrcRow;
+    uint16_t usX;        // destination x of the first covered pixel
+    uint16_t usY;        // destination y of the line
+} PNGTRACELINE;
+
+typedef struct png_trace_stats_tag
+{
+    uint32_t u32TotalPixels;
+    uint32_t u32TransparentPixels;
+    uint32_t u32FilterCount[PNG_FILTER_COUNT];
+    uint32_t u32PassCount[PNG_TRACE_MAX_PASS + 1]; // index 0 = non-interlaced
+    uint32_t u32DroppedRecords; // records lost because the caller's buffer was full
+} PNGTRACESTATS;
+
+static volatile uint8_t g_ucPNGTraceEnabled = 0;
+static uint8_t g_ucPNGTraceGranularity = PNG_TRACE_OFF;
+static void *g_pPNGTraceBuffer = NULL;
+static uint32_t g_u32PNGTraceCapacity = 0; // in records of the selected granularity
+static uint32_t g_u32PNGTraceUsed = 0;
+static PNGTRACESTATS g_PNGTraceStats;
+
+//
+// Enable tracing for the next decode().
+// iGranularity: PNG_TRACE_LINE or PNG_TRACE_PIXEL.
+// pBuffer must hold iCapacity records (PNGTRACELINE or PNGTRACEPIXEL).
+// Returns 1 on success, 0 on bad parameters.
+//
+PNG_STATIC int PNG_TraceBegin(int iGranularity, void *pBuffer, uint32_t u32Capacity) PNG_TRACE_UNUSED;
+PNG_STATIC int PNG_TraceBegin(int iGranularity, void *pBuffer, uint32_t u32Capacity)
+{
+    if (pBuffer == NULL || u32Capacity == 0 ||
+        (iGranularity != PNG_TRACE_LINE && iGranularity != PNG_TRACE_PIXEL))
+        return 0;
+    g_ucPNGTraceGranularity = (uint8_t)iGranularity;
+    g_pPNGTraceBuffer = pBuffer;
+    g_u32PNGTraceCapacity = u32Capacity;
+    g_u32PNGTraceUsed = 0;
+    memset(&g_PNGTraceStats, 0, sizeof(g_PNGTraceStats));
+    g_ucPNGTraceEnabled = 1;
+    return 1;
+} /* PNG_TraceBegin() */
+
+//
+// Stop tracing and return the collected statistics.
+//
+PNG_STATIC void PNG_TraceEnd(PNGTRACESTATS *pStats) PNG_TRACE_UNUSED;
+PNG_STATIC void PNG_TraceEnd(PNGTRACESTATS *pStats)
+{
+    g_ucPNGTraceEnabled = 0;
+    g_ucPNGTraceGranularity = PNG_TRACE_OFF;
+    if (pStats)
+        *pStats = g_PNGTraceStats;
+} /* PNG_TraceEnd() */
+
+//
+// Determine whether one native PNG pixel (already de-filtered) is transparent.
+//
+PNG_STATIC int PNGTraceIsTransparent(PNGIMAGE *pPage, uint8_t *pPixel)
+{
+    switch (pPage->ucPixelType) {
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            return pPixel[3] == 0;
+        case PNG_PIXEL_GRAY_ALPHA:
+            return pPixel[1] == 0;
+        case PNG_PIXEL_INDEXED:
+            if (pPage->iHasAlpha) {
+                int iIndex = pPixel[0] & ((1 << pPage->ucBpp) - 1);
+                return pPage->ucPalette[768 + iIndex] == 0;
+            }
+            return 0;
+        case PNG_PIXEL_TRUECOLOR:
+            if (pPage->iHasAlpha) // tRNS single transparent color
+                return (pPixel[0] == (uint8_t)(pPage->iTransparent >> 16) &&
+                        pPixel[1] == (uint8_t)(pPage->iTransparent >> 8) &&
+                        pPixel[2] == (uint8_t)pPage->iTransparent);
+            return 0;
+        case PNG_PIXEL_GRAYSCALE:
+            if (pPage->iHasAlpha)
+                return pPixel[0] == (uint8_t)pPage->iTransparent;
+            return 0;
+        default:
+            return 0;
+    }
+} /* PNGTraceIsTransparent() */
+
+// Nonzero for packed sub-byte pixel types (1/2/4 bpp grayscale or indexed)
+PNG_STATIC int PNGTraceBppPacked(PNGIMAGE *pPage)
+{
+    if ((pPage->ucPixelType == PNG_PIXEL_GRAYSCALE || pPage->ucPixelType == PNG_PIXEL_INDEXED) &&
+        pPage->ucBpp < 8)
+        return 1;
+    return 0;
+} /* PNGTraceBppPacked() */
+
+//
+// Record provenance for one completed scanline.
+// iPass: 0 for non-interlaced, 1..7 for Adam7 passes.
+// iSrcRow: scanline index inside the pass/sub-image.
+// iDstX/iDstY: destination position of the line's first pixel.
+// iLineW: number of pixels in this (sub-image) line.
+//
+PNG_STATIC void PNGTraceScanLine(PNGIMAGE *pPage, uint8_t *pLine, int iFilter,
+                                 int iPass, int iSrcRow, int iDstX, int iDstY, int iLineW)
+{
+    int x, iBpp;
+    uint8_t *pPixel;
+
+    if (!g_ucPNGTraceEnabled) return;
+    if (iFilter < 0 || iFilter >= PNG_FILTER_COUNT) iFilter = 0;
+    g_PNGTraceStats.u32FilterCount[iFilter] += (uint32_t)iLineW;
+    g_PNGTraceStats.u32PassCount[iPass] += (uint32_t)iLineW;
+    g_PNGTraceStats.u32TotalPixels += (uint32_t)iLineW;
+
+    iBpp = PNGPixelBytes(pPage);
+
+    if (g_ucPNGTraceGranularity == PNG_TRACE_LINE) {
+        PNGTRACELINE *pRec;
+        if (g_u32PNGTraceUsed >= g_u32PNGTraceCapacity) {
+            g_PNGTraceStats.u32DroppedRecords++;
+        } else {
+            pRec = (PNGTRACELINE *)g_pPNGTraceBuffer + g_u32PNGTraceUsed;
+            pRec->ucFilter = (uint8_t)iFilter;
+            pRec->ucPass = (uint8_t)iPass;
+            pRec->usSrcRow = (uint16_t)iSrcRow;
+            pRec->usX = (uint16_t)iDstX;
+            pRec->usY = (uint16_t)iDstY;
+            g_u32PNGTraceUsed++;
+        }
+        return;
+    }
+
+    // PNG_TRACE_PIXEL: one record per output pixel
+    if (PNGTraceBppPacked(pPage)) { // unpack sub-byte pixels (MSB first)
+        uint8_t ucByte = 0;
+        for (x = 0; x < iLineW; x++) {
+            uint8_t ucIndex;
+            int iTransparent;
+            PNGTRACEPIXEL *pRec;
+            if ((x * pPage->ucBpp & 7) == 0)
+                ucByte = pLine[x * pPage->ucBpp >> 3];
+            ucIndex = (uint8_t)((ucByte >> ((8 - pPage->ucBpp) - ((x * pPage->ucBpp) & 7))) &
+                                ((1 << pPage->ucBpp) - 1));
+            iTransparent = PNGTraceIsTransparent(pPage, &ucIndex);
+            if (iTransparent) g_PNGTraceStats.u32TransparentPixels++;
+            if (g_u32PNGTraceUsed >= g_u32PNGTraceCapacity) {
+                g_PNGTraceStats.u32DroppedRecords += (uint32_t)(iLineW - x);
+                break;
+            }
+            pRec = (PNGTRACEPIXEL *)g_pPNGTraceBuffer + g_u32PNGTraceUsed;
+            pRec->ucFilter = (uint8_t)iFilter;
+            pRec->ucPass = (uint8_t)iPass;
+            pRec->ucTransparent = (uint8_t)iTransparent;
+            pRec->ucReserved = 0;
+            pRec->usSrcRow = (uint16_t)iSrcRow;
+            g_u32PNGTraceUsed++;
+        }
+    } else { // byte aligned pixels
+        for (x = 0; x < iLineW; x++) {
+            int iTransparent;
+            PNGTRACEPIXEL *pRec;
+            if (g_u32PNGTraceUsed >= g_u32PNGTraceCapacity) {
+                g_PNGTraceStats.u32DroppedRecords += (uint32_t)(iLineW - x);
+                break;
+            }
+            pPixel = &pLine[x * iBpp];
+            iTransparent = PNGTraceIsTransparent(pPage, pPixel);
+            if (iTransparent) g_PNGTraceStats.u32TransparentPixels++;
+            pRec = (PNGTRACEPIXEL *)g_pPNGTraceBuffer + g_u32PNGTraceUsed;
+            pRec->ucFilter = (uint8_t)iFilter;
+            pRec->ucPass = (uint8_t)iPass;
+            pRec->ucTransparent = (uint8_t)iTransparent;
+            pRec->ucReserved = 0;
+            pRec->usSrcRow = (uint16_t)iSrcRow;
+            g_u32PNGTraceUsed++;
+        }
+    }
+} /* PNGTraceScanLine() */
+
+#else // !PNG_PROVENANCE
+
+#define PNGTraceScanLine(pPage, pLine, iFilter, iPass, iSrcRow, iDstX, iDstY, iLineW) ((void)0)
+
+#endif // PNG_PROVENANCE
 //
 // Decode the PNG file
 //
@@ -813,13 +1137,21 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     int bDone, iOffset, iFileOffset, iBytesRead, iAvailable;
     int iMarker=0;
     uint8_t *tmp, *pCurr, *pPrev;
+    int iPass, iPassW, iPassH, iPassPitch, iRowInPass, iCurrPitch;
+    int iStartX, iStartY, iStepX, iStepY, iTotalLines;
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
-    
+
     // Either the image buffer must be allocated or a draw callback must be set before entering
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
         pPage->iError = PNG_NO_BUFFER;
+        return 0;
+    }
+    // Adam7 interlacing can only be assembled into a full framebuffer;
+    // line-by-line callback output does not have a destination for the sparse passes.
+    if (pPage->iInterlaced && pPage->pImage == NULL) {
+        pPage->iError = PNG_UNSUPPORTED_FEATURE;
         return 0;
     }
     // Use internal buffer to maintain the current and previous lines
@@ -858,9 +1190,52 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     d_stream.avail_out = 0;
     d_stream.next_out = pPage->pImage;
 
+    // Adam7 geometry. Non-interlaced images are treated as a single "pass 0"
+    // so the same inflate loop drives both cases.
+    if (pPage->iInterlaced) {
+        int iTmp;
+        iPass = 0; // will be advanced to 1 by the setup below
+        iPassW = iPassH = iPassPitch = iRowInPass = 0;
+        iStartX = iStartY = iStepX = iStepY = 0;
+        iCurrPitch = 0;
+        iTotalLines = 0;
+        // total number of sub-image scanlines across all 7 passes
+        for (iTmp = 0; iTmp < 7; iTmp++) {
+            int iW = PNGAdam7Dim(pPage->iWidth, u8Adam7StartX[iTmp], u8Adam7StepX[iTmp]);
+            int iH = PNGAdam7Dim(pPage->iHeight, u8Adam7StartY[iTmp], u8Adam7StepY[iTmp]);
+            if (iW && iH) iTotalLines += iH;
+        }
+        // advance to the first non-empty pass
+        do {
+            iPass++;
+            iStartX = u8Adam7StartX[iPass-1];
+            iStartY = u8Adam7StartY[iPass-1];
+            iStepX  = u8Adam7StepX[iPass-1];
+            iStepY  = u8Adam7StepY[iPass-1];
+            iPassW = PNGAdam7Dim(pPage->iWidth, iStartX, iStepX);
+            iPassH = PNGAdam7Dim(pPage->iHeight, iStartY, iStepY);
+        } while ((iPassW == 0 || iPassH == 0) && iPass < 7);
+        if (iPassW && iPassH) {
+            iPassPitch = PNGLinePitch(pPage, iPassW);
+            iCurrPitch = iPassPitch;
+            iRowInPass = 0;
+            memset(pPrev, 0, (size_t)(iPassPitch + 1)); // each Adam7 pass starts with an empty previous line
+        }
+    } else {
+        iPass = 0;
+        iPassW = pPage->iWidth;
+        iPassH = pPage->iHeight;
+        iPassPitch = pPage->iPitch;
+        iCurrPitch = pPage->iPitch;
+        iRowInPass = 0;
+        iStartX = iStartY = 0;
+        iStepX = iStepY = 1;
+        iTotalLines = pPage->iHeight;
+    }
+
     // continue until fully decoded
     // parse the markers until the next data block
-    while (!bDone && y < pPage->iHeight)
+    while (!bDone && y < iTotalLines)
     {
         if (iOffset > iBytesRead-8) { // need to read more data
             iFileOffset += (iOffset - iBytesRead);
@@ -966,12 +1341,15 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                     err = 0;
                     while (err == Z_OK) {
                         if (d_stream.avail_out == 0) { // reset for next line
-                            d_stream.avail_out = pPage->iPitch+1;
+                            d_stream.avail_out = iCurrPitch+1;
                             d_stream.next_out = pCurr;
                         } // otherwise it could be a continuation of an unfinished line
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
                         if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
-                            DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
+#if PNG_PROVENANCE
+                            int iLineFilter = pCurr[0];
+#endif
+                            DeFilter(pCurr, pPrev, iPassW, iPassPitch);
                             if (pPage->pImage == NULL) { // no image buffer, send it line by line
                                 PNGDRAW pngd;
                                 pngd.pUser = pUser;
@@ -988,21 +1366,62 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                                     pPage->iError = PNG_QUIT_EARLY;
                                     bDone = TRUE;
                                 }
+                            } else if (pPage->iInterlaced) {
+                                // scatter the sub-image line onto the full framebuffer
+                                PNGScatterLine(pPage, &pCurr[1], iPass-1, iRowInPass, iPassW);
                             } else {
                                 // copy to destination bitmap
                                 memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
                             }
-                            y++;
+                            // provenance (compiled out unless PNG_PROVENANCE)
+                            PNGTraceScanLine(pPage, &pCurr[1], iLineFilter, iPass, iRowInPass,
+                                             iPass ? iStartX : 0,
+                                             iPass ? (iStartY + iRowInPass * iStepY) : y,
+                                             iPassW);
+                            y++; // count output lines (non-interlaced) / sub-image lines
+                            iRowInPass++;
                         // swap current and previous lines
                         tmp = pCurr; pCurr = pPrev; pPrev = tmp;
+                        // Advance to the next non-empty Adam7 pass when this one is done
+                        if (pPage->iInterlaced && iRowInPass >= iPassH) {
+                            int iNextPass = iPass;
+                            do {
+                                iNextPass++;
+                                if (iNextPass > 7) { // all passes consumed
+                                    iNextPass = 0;
+                                    break;
+                                }
+                                iStartX = u8Adam7StartX[iNextPass-1];
+                                iStartY = u8Adam7StartY[iNextPass-1];
+                                iStepX  = u8Adam7StepX[iNextPass-1];
+                                iStepY  = u8Adam7StepY[iNextPass-1];
+                                iPassW = PNGAdam7Dim(pPage->iWidth, iStartX, iStepX);
+                                iPassH = PNGAdam7Dim(pPage->iHeight, iStartY, iStepY);
+                            } while (iPassW == 0 || iPassH == 0);
+                            if (iNextPass == 0) {
+                                iPass = 7; // mark finished; stream end is expected next
+                            } else {
+                                iPass = iNextPass;
+                                iPassPitch = PNGLinePitch(pPage, iPassW);
+                                iCurrPitch = iPassPitch;
+                                iRowInPass = 0;
+                                memset(pPrev, 0, (size_t)(iPassPitch + 1)); // new pass: empty previous line
+                            }
+                        }
                         } else { // some error
                             tmp = NULL;
                         }
                     }
                     if (err == Z_STREAM_END && d_stream.avail_out == 0) {
-                        // successful decode, stop here
-                        y = pPage->iHeight;
-                        bDone = TRUE;
+                        if (pPage->iInterlaced && (iPass < 7 || iRowInPass < iPassH)) {
+                            // stream ended before every Adam7 pass was delivered
+                            pPage->iError = PNG_DECODE_ERROR;
+                            bDone = TRUE;
+                        } else {
+                            // successful decode, stop here
+                            y = pPage->iHeight;
+                            bDone = TRUE;
+                        }
                     } else  if (err == Z_DATA_ERROR || err == Z_STREAM_ERROR) {
                         iLen = 0; // quit now
                         y = pPage->iHeight;

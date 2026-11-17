@@ -1,0 +1,19 @@
+In file included from main.cpp:21:
+../../../src/crc32.c: In function ‘long unsigned int crc32_little(long unsigned int, const unsigned char*, z_size_t)’:
+../../../src/crc32.c:262:22: warning: ISO C++17 does not allow ‘register’ storage class specifier [-Wregister]
+  262 |     register z_crc_t c;
+      |                      ^
+../../../src/crc32.c:263:33: warning: ISO C++17 does not allow ‘register’ storage class specifier [-Wregister]
+  263 |     register const z_crc_t FAR *buf4;
+      |                                 ^~~~
+../../../src/crc32.c: In function ‘long unsigned int crc32_big(long unsigned int, const unsigned char*, z_size_t)’:
+../../../src/crc32.c:299:22: warning: ISO C++17 does not allow ‘register’ storage class specifier [-Wregister]
+  299 |     register z_crc_t c;
+      |                      ^
+../../../src/crc32.c:300:33: warning: ISO C++17 does not allow ‘register’ storage class specifier [-Wregister]
+  300 |     register const z_crc_t FAR *buf4;
+      |                                 ^~~~
+main.cpp: In function ‘int main(int, const char**)’:
+main.cpp:366:16: warning: comparison of integer expressions of different signedness: ‘int’ and ‘long unsigned int’ [-Wsign-compare]
+  366 |     for (i=0; i<sizeof(octocat_8bpp); i++) { // corrupt each byte one at a time by inverting it
+      |               ~^~~~~~~~~~~~~~~~~~~~~

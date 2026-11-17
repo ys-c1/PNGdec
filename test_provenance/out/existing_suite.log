@@ -1,0 +1,60 @@
+../../../src/inffast.c:288:50: runtime error: store to misaligned address 0x5a11e0ed2bf9 for type 'uint32_t', which requires 4 byte alignment
+0x5a11e0ed2bf9: note: pointer points here
+ 00 00 00  ff 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00
+              ^ 
+../../../src/inflate.c:1324:42: runtime error: store to misaligned address 0x5a11e0ed3001 for type 'uint32_t', which requires 4 byte alignment
+0x5a11e0ed3001: note: pointer points here
+ ff ff ff  ff ff ff 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00
+              ^ 
+../../../src/inflate.c:1308:42: runtime error: store to misaligned address 0x5a11e0ed30b7 for type 'uint32_t', which requires 4 byte alignment
+0x5a11e0ed30b7: note: pointer points here
+ ff 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00
+             ^ 
+../../../src/inflate.c:1308:44: runtime error: load of misaligned address 0x5a11e0ecaca5 for type 'uint32_t', which requires 4 byte alignment
+0x5a11e0ecaca5: note: pointer points here
+ ff ff ff ff 00 ff ff  ff ff ff ff ff ff ff ff  ff ff ff ff ff ff ff ff  ff ff ff ff ff ff ff ff  ff
+             ^ 
+../../../src/inffast.c:285:41: runtime error: load of misaligned address 0x5a11e0ed3397 for type 'uint32_t', which requires 4 byte alignment
+0x5a11e0ed3397: note: pointer points here
+ ff ff ff ff ff  00 00 00 ff ff ff ff ff  ff ff ff ff ff ff ff ff  ff ff ff ff ff ff ff ff  ff ff ff
+             ^ 
+../../../src/inffast.c:243:48: runtime error: load of misaligned address 0x5a11e0ecbdb9 for type 'uint32_t', which requires 4 byte alignment
+0x5a11e0ecbdb9: note: pointer points here
+ ff ff ff  ff 00 00 00 ff 00 00 00  ff 00 00 00 ff 00 00 00  ff 00 00 00 ff ff ff ff  ff ff ff ff ff
+              ^ 
+../../../src/inffast.c:243:46: runtime error: store to misaligned address 0x5a11e0ed2bfa for type 'uint32_t', which requires 4 byte alignment
+0x5a11e0ed2bfa: note: pointer points here
+ 00 00  00 00 ff ff ff ff ff ff  ff ff ff ff ff ff ff ff  ff ff ff ff 00 00 00 ff  00 00 00 ff 00 00
+              ^ 
+Line: 120: msg: Test Continuation - START
+Line: 132: msg: Test Continuation - PASSED
+Line: 151: msg: Test User pointer - START
+Line: 162: msg: Test User pointer - PASSED
+Line: 173: msg: PNG bad parameter test 1 - START
+Line: 179: msg: PNG bad parameter test 1 - PASSED
+Line: 187: msg: PNG verify pixel format - START
+Line: 193: msg: PNG verify pixel format - PASSED
+Line: 201: msg: PNG verify correct dimensions - START
+Line: 207: msg: PNG verify correct dimensions - PASSED
+Line: 215: msg: PNG Check CRC timing - START
+Line: 228: msg: PNG Check CRC timing - PASSED
+Line: 236: msg: PNG Check palette options - START
+Line: 247: msg: PNG Check palette options - PASSED
+Line: 255: msg: PNG Check full framebuffer decode - START
+Line: 265: msg: PNG Check full framebuffer decode - PASSED
+Line: 276: msg: PNG Verify 8-bit to RGB565 output - START
+Line: 284: msg: PNG Verify 8-bit to RGB565 output - PASSED
+Line: 294: msg: PNG Verify 32-bit to RGB565 output - START
+Line: 302: msg: PNG Verify 32-bit to RGB565 output - PASSED
+Line: 311: msg: PNG decode aborted early - START
+Line: 319: msg: PNG decode aborted early - PASSED
+Line: 328: msg: PNG does not contain a comment chunk - START
+Line: 335: msg: PNG does not contain a comment chunk - PASSED
+Line: 343: msg: PNG contains a comment chunk - START
+Line: 350: msg: PNG contains a comment chunk - PASSED
+Begin fuzz testing...
+Line: 363: msg: Single Byte Sequential Corruption Test - START
+Line: 373: msg: Single Byte Sequential Corruption Test - PASSED
+Line: 379: msg: Multi-Byte Random Corruption Test - START
+Line: 391: msg: Multi-Byte Random Corruption Test - PASSED
+Total tests: 15, 15 passed, 0 failed
