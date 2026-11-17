@@ -21,6 +21,26 @@
 //
 #include "zlib.h"
 //
+// Optional decode() flag (additional iOptions bit, value 4):
+//
+// For indexed (palette) images, this asks the decoder to store the palette
+// index of every pixel as one byte per pixel in the buffer supplied through
+// setBuffer(). The indexed buffer is width * height bytes, row-major, with
+// entry [y * width + x] describing the pixel at (x, y). The palette itself
+// is still available through getPalette() / pDraw->pPalette and uses the same
+// index values; palette alpha (if a tRNS chunk is present) still starts at
+// pPalette[768].
+//
+// If a draw callback is also installed, it keeps receiving the original
+// packed source rows for each line, so RGB565 (or any other) output can be
+// produced in the same decode pass. Without a draw callback only the index
+// array is produced. Using this option on a non-indexed image, or without an
+// image buffer, is reported as an error (see DecodePNG()).
+//
+#ifndef PNG_INDEXED_OUTPUT
+#define PNG_INDEXED_OUTPUT 4
+#endif
+//
 // Convert 8-bit grayscale into RGB565
 //
 static const uint16_t usGrayTo565[] = {0x0000,0x0000,0x0000,0x0000,0x0020,0x0020,0x0020,0x0020, // 0
@@ -791,6 +811,44 @@ PNG_STATIC void DeFilter(uint8_t *pCurr, uint8_t *pPrev, int iWidth, int iPitch)
     } // switch on filter type
 } /* DeFilter() */
 //
+// Expand one de-filtered line of 1/2/4/8-bit palette indexes into
+// one byte per pixel (0..255), so callers can remap the indexes themselves
+//
+PNG_STATIC void PNGUnpackIndexes(uint8_t *pDest, uint8_t *pSrc, int iWidth, int iBpp)
+{
+    int x;
+    uint8_t c = 0;
+
+    switch (iBpp) {
+        case 8:
+            memcpy(pDest, pSrc, iWidth);
+            break;
+        case 4:
+            for (x = 0; x < iWidth; x++) {
+                if ((x & 1) == 0)
+                    c = *pSrc++;
+                *pDest++ = (x & 1) ? (c & 0xf) : (c >> 4);
+            }
+            break;
+        case 2:
+            for (x = 0; x < iWidth; x++) {
+                if ((x & 3) == 0)
+                    c = *pSrc++;
+                *pDest++ = (c >> 6);
+                c <<= 2;
+            }
+            break;
+        case 1:
+            for (x = 0; x < iWidth; x++) {
+                if ((x & 7) == 0)
+                    c = *pSrc++;
+                *pDest++ = (c >> 7);
+                c <<= 1;
+            }
+            break;
+    } // switch on bit depth
+} /* PNGUnpackIndexes() */
+//
 // PNGInit
 // Parse the PNG file header and confirm that it's a valid file
 //
@@ -816,11 +874,22 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
-    
+
     // Either the image buffer must be allocated or a draw callback must be set before entering
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
         pPage->iError = PNG_NO_BUFFER;
         return 0;
+    }
+    // Indexed output needs a byte-per-pixel buffer and only means something for palette images
+    if (iOptions & PNG_INDEXED_OUTPUT) {
+        if (pPage->ucPixelType != PNG_PIXEL_INDEXED) {
+            pPage->iError = PNG_UNSUPPORTED_FEATURE; // not a palette image; no indexes to return
+            return pPage->iError;
+        }
+        if (pPage->pImage == NULL) {
+            pPage->iError = PNG_NO_BUFFER; // needs setBuffer() for the index array
+            return pPage->iError;
+        }
     }
     // Use internal buffer to maintain the current and previous lines
     y = (int)(intptr_t)&pPage->ucPixels[0];
@@ -972,7 +1041,16 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
                         if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
                             DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
-                            if (pPage->pImage == NULL) { // no image buffer, send it line by line
+                            if (iOptions & PNG_INDEXED_OUTPUT) {
+                                // store one palette index per pixel (row-major, width bytes per line)
+                                PNGUnpackIndexes(&pPage->pImage[(size_t)y * pPage->iWidth], &pCurr[1], pPage->iWidth, pPage->ucBpp);
+                            } else if (pPage->pImage != NULL) {
+                                // copy to destination bitmap
+                                memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
+                            }
+                            // With PNG_INDEXED_OUTPUT, a callback (if set) still receives the
+                            // original packed line, letting the same pass produce RGB output
+                            if (pPage->pfnDraw != NULL && (pPage->pImage == NULL || (iOptions & PNG_INDEXED_OUTPUT))) {
                                 PNGDRAW pngd;
                                 pngd.pUser = pUser;
                                 pngd.iPitch = pPage->iPitch;
@@ -988,9 +1066,6 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                                     pPage->iError = PNG_QUIT_EARLY;
                                     bDone = TRUE;
                                 }
-                            } else {
-                                // copy to destination bitmap
-                                memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
                             }
                             y++;
                         // swap current and previous lines
