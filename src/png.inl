@@ -695,6 +695,368 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
 
     return PNG_SUCCESS;
 } /* PNGParseInfo() */
+
+// ===========================================================================
+// PNG header cache
+// -------------
+// Caches the parsed header information (dimensions, bit depth, pitch, pixel
+// type, transparency value and the PLTE/tRNS palette bytes) keyed by a
+// fingerprint of exactly the chunks those fields come from (IHDR + PLTE +
+// tRNS). Decoding the same data frame after frame then skips re-parsing the
+// header entirely. If any of those header bytes change in place, the
+// fingerprint changes and the stale entry is not used; ancillary chunks that
+// no cached field depends on (tEXt, gAMA, ...) and IDAT pixel data do not
+// affect the fingerprint.
+//
+// The entry table is statically allocated (no malloc/free) and entries are
+// immutable while published, so several decoder threads can share one
+// read-only cache. On POSIX systems a pthread mutex guards table updates; on
+// single-threaded bare-metal/Arduino builds the locks compile to no-ops.
+//
+// This only changes the open/parse phase; DecodePNG() (inflate + de-filter +
+// per-pixel output) is untouched.
+// ===========================================================================
+#ifndef PNG_CACHE_MAX_ENTRIES
+#define PNG_CACHE_MAX_ENTRIES 16 // hard upper bound on cached files
+#endif
+// eviction policies selectable through PNG_cache_configure()
+enum {
+    PNG_CACHE_LRU = 0,  // evict the least recently used entry
+    PNG_CACHE_FIFO = 1  // evict the oldest inserted entry
+};
+
+typedef struct png_cache_entry_tag
+{
+    int iInUse;
+    uint64_t u64Fingerprint; // fingerprint of the source buffer
+    int iDataSize;           // source buffer length
+    int iWidth, iHeight;
+    int iPitch, iHasAlpha, iInterlaced;
+    int iPlteLen;            // declared PLTE bytes (0 = no PLTE)
+    int iTrnsLen;            // declared tRNS alpha bytes (0 = none)
+    uint32_t iTransparent;
+    uint8_t ucBpp, ucPixelType;
+    uint8_t ucPalette[1024]; // PLTE RGB triples + tRNS alpha at [768..]
+    uint32_t u32TickInsert;  // insertion order (FIFO)
+    uint32_t u32TickUse;     // last-use order (LRU)
+} PNGCACHEENTRY;
+
+static PNGCACHEENTRY PNGCacheTable[PNG_CACHE_MAX_ENTRIES];
+static int PNGCacheCapacity = (PNG_CACHE_MAX_ENTRIES > 0) ? PNG_CACHE_MAX_ENTRIES : 1;
+static int PNGCachePolicy = PNG_CACHE_LRU;
+static int PNGCacheThreads = 1;
+static uint32_t PNGCacheTick = 0;
+static uint32_t PNGCacheHits = 0;
+static uint32_t PNGCacheMisses = 0;
+static uint32_t PNGCacheParseCount = 0;
+static uint32_t PNGCacheEvictions = 0;
+
+#if defined(__LINUX__) || defined(__MACH__)
+#include <pthread.h>
+static pthread_once_t PNGCacheOnce = PTHREAD_ONCE_INIT;
+static pthread_mutex_t PNGCacheMutex;
+PNG_STATIC void PNGCacheInitOnce(void)
+{
+    pthread_mutex_init(&PNGCacheMutex, NULL);
+} /* PNGCacheInitOnce() */
+PNG_STATIC void PNGCacheLock(void)
+{
+    pthread_once(&PNGCacheOnce, PNGCacheInitOnce);
+    pthread_mutex_lock(&PNGCacheMutex);
+} /* PNGCacheLock() */
+PNG_STATIC void PNGCacheUnlock(void)
+{
+    pthread_mutex_unlock(&PNGCacheMutex);
+} /* PNGCacheUnlock() */
+#else
+// Single-threaded targets: no locking needed.
+PNG_STATIC void PNGCacheLock(void) {}
+PNG_STATIC void PNGCacheUnlock(void) {}
+#endif
+
+//
+// FNV-1a (64-bit) fingerprint. By default only the bytes that can actually
+// change a cached field are folded in: the 33-byte signature+IHDR prefix and
+// the PLTE/tRNS chunks (located by a bounded walk), plus the total buffer
+// length. Ancillary chunks such as tEXt are deliberately skipped, so the hash
+// cost tracks the header's semantic content, not its padding. Define
+// PNG_CACHE_FULL_FINGERPRINT to hash the whole buffer instead, so that
+// literally any in-place byte edit (including IDAT) forces a miss.
+//
+static uint64_t PNGFNV(uint64_t u64Hash, const uint8_t *pData, int iLen)
+{
+    int i;
+    for (i = 0; i < iLen; i++) {
+        u64Hash ^= (uint64_t)pData[i];
+        u64Hash *= 1099511628211ULL; // FNV prime
+    }
+    return u64Hash;
+} /* PNGFNV() */
+
+PNG_STATIC uint64_t PNGFingerprint(const uint8_t *pData, int iLen)
+{
+    uint64_t u64Hash = 1469598103934665603ULL; // FNV offset basis
+#ifdef PNG_CACHE_FULL_FINGERPRINT
+    u64Hash = PNGFNV(u64Hash, pData, iLen);
+#else
+    int iOff, iPrefix = iLen < 33 ? iLen : 33;
+    // Everything PNGParseInfo() validates lives in the first 33 bytes.
+    u64Hash = PNGFNV(u64Hash, pData, iPrefix);
+    // Fold in only the chunks the cache stores anything from.
+    iOff = 8; // skip the PNG signature
+    while (iOff + 8 <= iLen) {
+        uint32_t u32Len = (uint32_t)MOTOLONG(&pData[iOff]);
+        uint32_t u32Type = (uint32_t)MOTOLONG(&pData[iOff + 4]);
+        int iData = iOff + 8;
+        if ((int64_t)iData + (int64_t)u32Len + 4 > (int64_t)iLen)
+            break; // truncated: the prefix hash + length still discriminates
+        if (u32Type == 0x49444154U /*'IDAT'*/)
+            break; // no cacheable field occurs at or after IDAT
+        if (u32Type == 0x504c5445U /*'PLTE'*/ ||
+            u32Type == 0x74524e53U /*'tRNS'*/) {
+            u64Hash = PNGFNV(u64Hash, &pData[iOff + 4], 4); // chunk type
+            u64Hash = PNGFNV(u64Hash, &pData[iData], (int)u32Len);
+        }
+        iOff = iData + (int)u32Len + 4;
+    }
+#endif
+    u64Hash = PNGFNV(u64Hash, (const uint8_t *)&iLen, (int)sizeof(iLen));
+    return u64Hash;
+} /* PNGFingerprint() */
+
+//
+// Copy a published, immutable cache entry into a decoder instance.
+// Called while the cache lock is held; only the local PNGIMAGE is mutated.
+// Only the palette bytes actually populated by PLTE/tRNS are copied.
+//
+PNG_STATIC void PNGCacheApply(PNGIMAGE *pPNG, const PNGCACHEENTRY *pEntry)
+{
+    pPNG->iWidth = pEntry->iWidth;
+    pPNG->iHeight = pEntry->iHeight;
+    pPNG->iPitch = pEntry->iPitch;
+    pPNG->iHasAlpha = pEntry->iHasAlpha;
+    pPNG->iInterlaced = pEntry->iInterlaced;
+    pPNG->iTransparent = pEntry->iTransparent;
+    pPNG->ucBpp = pEntry->ucBpp;
+    pPNG->ucPixelType = pEntry->ucPixelType;
+    pPNG->iError = PNG_SUCCESS;
+    // Restore only the bytes the chunks actually declared. The PNGIMAGE was
+    // zero-initialized by open*(), matching legacy state for unused slots;
+    // a subsequent decode() reloads PLTE/tRNS from the stream anyway.
+    if (pEntry->iPlteLen > 0)
+        memcpy(pPNG->ucPalette, pEntry->ucPalette, (size_t)pEntry->iPlteLen);
+    if (pEntry->iTrnsLen > 0)
+        memcpy(&pPNG->ucPalette[768], &pEntry->ucPalette[768],
+               (size_t)pEntry->iTrnsLen);
+} /* PNGCacheApply() */
+
+//
+// On a cache miss, walk the chunks preceding IDAT in the memory buffer and
+// collect the palette (PLTE) and transparency (tRNS) information. The header
+// itself has already been validated by PNGParseInfo(). Every access is
+// bounds-checked so corrupt/truncated data can never read past the buffer.
+//
+PNG_STATIC void PNGCacheCollectChunks(PNGIMAGE *pPNG, int *pPlteLen, int *pTrnsLen)
+{
+    int iOff = 8; // skip the PNG signature
+    int iSize = pPNG->PNGFile.iSize;
+    const uint8_t *pData = pPNG->PNGFile.pData;
+    int iPlteLen = 0, iTrnsLen = 0;
+
+    while (iOff + 8 <= iSize) {
+        uint32_t u32Len = (uint32_t)MOTOLONG(&pData[iOff]);
+        uint32_t u32Type = (uint32_t)MOTOLONG(&pData[iOff + 4]);
+        int iData = iOff + 8;
+
+        if ((int64_t)iData + (int64_t)u32Len + 4 > (int64_t)iSize)
+            break; // truncated chunk: stop before IDAT, nothing more to cache
+        if (u32Type == 0x49444154U /*'IDAT'*/ ||
+            u32Type == 0x49454e44U /*'IEND'*/)
+            break; // image data starts here; header section is complete
+        if (u32Type == 0x504c5445U /*'PLTE'*/) {
+            if (u32Len > 0 && u32Len <= 768) {
+                // open*() zero-initializes the PNGIMAGE, so unused RGB slots
+                // are already 0 as after a decode; only declared bytes move.
+                memcpy(pPNG->ucPalette, &pData[iData], u32Len);
+                iPlteLen = (int)u32Len;
+            }
+        } else if (u32Type == 0x74524e53U /*'tRNS'*/) {
+            if (pPNG->ucPixelType == PNG_PIXEL_INDEXED && u32Len > 0 && u32Len <= 256) {
+                // DecodePNG() fills the remaining alpha slots with 0xff; keep
+                // the cached canonical state identical to open+decode.
+                memset(&pPNG->ucPalette[768], 0xff, 256);
+                memcpy(&pPNG->ucPalette[768], &pData[iData], u32Len);
+                iTrnsLen = 256;
+                pPNG->iHasAlpha = 1;
+            } else if (u32Len == 2) { // grayscale transparent color
+                pPNG->iTransparent = pData[iData + 1];
+                pPNG->iHasAlpha = 1;
+            } else if (u32Len == 6) { // truecolor transparent color
+                pPNG->iTransparent = pData[iData + 5];
+                pPNG->iTransparent |= (pData[iData + 3] << 8);
+                pPNG->iTransparent |= (pData[iData + 1] << 16);
+                pPNG->iHasAlpha = 1;
+            }
+        }
+        iOff = iData + (int)u32Len + 4; // data + CRC
+    }
+    *pPlteLen = iPlteLen;
+    *pTrnsLen = iTrnsLen;
+} /* PNGCacheCollectChunks() */
+
+//
+// Replacement for the plain PNGParseInfo() call inside PNGInit().
+// Memory-backed decoders (openRAM/openFLASH) consult the shared header
+// cache; file-backed decoders keep the legacy parse-every-time behavior.
+//
+PNG_STATIC int PNGCacheOpen(PNGIMAGE *pPNG)
+{
+    int i, iSlot, iRC;
+    uint64_t u64Fingerprint;
+    PNGCACHEENTRY *pEntry = NULL;
+
+    if (pPNG->PNGFile.pData == NULL) // file handle based: no buffer to hash
+        return PNGParseInfo(pPNG);
+
+    u64Fingerprint = PNGFingerprint(pPNG->PNGFile.pData, pPNG->PNGFile.iSize);
+
+    // ---- read-only fast path: lookup and apply under the shared lock ----
+    PNGCacheLock();
+    for (i = 0; i < PNGCacheCapacity; i++) {
+        if (PNGCacheTable[i].iInUse &&
+            PNGCacheTable[i].u64Fingerprint == u64Fingerprint &&
+            PNGCacheTable[i].iDataSize == pPNG->PNGFile.iSize) {
+            PNGCacheHits++;
+            PNGCacheTable[i].u32TickUse = ++PNGCacheTick;
+            PNGCacheApply(pPNG, &PNGCacheTable[i]);
+            PNGCacheUnlock();
+            return PNG_SUCCESS;
+        }
+    }
+    PNGCacheMisses++;
+    PNGCacheUnlock();
+
+    // ---- slow path: parse without holding the lock (local state only) ----
+    int iPlteLen = 0, iTrnsLen = 0;
+    iRC = PNGParseInfo(pPNG);
+    if (iRC != PNG_SUCCESS)
+        return iRC; // invalid/unsupported files are never cached
+    PNGCacheCollectChunks(pPNG, &iPlteLen, &iTrnsLen); // PLTE/tRNS to publish
+
+    // ---- publish the new entry ----
+    PNGCacheLock();
+    for (i = 0; i < PNGCacheCapacity; i++) { // another thread may have won
+        if (PNGCacheTable[i].iInUse &&
+            PNGCacheTable[i].u64Fingerprint == u64Fingerprint &&
+            PNGCacheTable[i].iDataSize == pPNG->PNGFile.iSize) {
+            PNGCacheTable[i].u32TickUse = ++PNGCacheTick;
+            PNGCacheUnlock();
+            return PNG_SUCCESS;
+        }
+    }
+    PNGCacheParseCount++; // first successful parse for this fingerprint
+    iSlot = -1;
+    for (i = 0; i < PNGCacheCapacity; i++) {
+        if (!PNGCacheTable[i].iInUse) { iSlot = i; break; }
+    }
+    if (iSlot < 0) { // table full: evict per the configured policy
+        uint32_t u32Oldest = 0xffffffffU;
+        for (i = 0; i < PNGCacheCapacity; i++) {
+            uint32_t u32Tick = (PNGCachePolicy == PNG_CACHE_FIFO) ?
+                               PNGCacheTable[i].u32TickInsert :
+                               PNGCacheTable[i].u32TickUse;
+            if (u32Tick < u32Oldest) { u32Oldest = u32Tick; iSlot = i; }
+        }
+        PNGCacheEvictions++;
+    }
+    pEntry = &PNGCacheTable[iSlot];
+    pEntry->iInUse = 1;
+    pEntry->u64Fingerprint = u64Fingerprint;
+    pEntry->iDataSize = pPNG->PNGFile.iSize;
+    pEntry->iWidth = pPNG->iWidth;
+    pEntry->iHeight = pPNG->iHeight;
+    pEntry->iPitch = pPNG->iPitch;
+    pEntry->iHasAlpha = pPNG->iHasAlpha;
+    pEntry->iInterlaced = pPNG->iInterlaced;
+    pEntry->iTransparent = pPNG->iTransparent;
+    pEntry->ucBpp = pPNG->ucBpp;
+    pEntry->ucPixelType = pPNG->ucPixelType;
+    pEntry->iPlteLen = iPlteLen;
+    pEntry->iTrnsLen = iTrnsLen;
+    if (iPlteLen > 0)
+        memcpy(pEntry->ucPalette, pPNG->ucPalette, (size_t)iPlteLen);
+    if (iTrnsLen > 0)
+        memcpy(&pEntry->ucPalette[768], &pPNG->ucPalette[768], (size_t)iTrnsLen);
+    pEntry->u32TickInsert = pEntry->u32TickUse = ++PNGCacheTick;
+    PNGCacheUnlock();
+    return PNG_SUCCESS;
+} /* PNGCacheOpen() */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+//
+// Runtime configuration of the header cache.
+// iMaxEntries: 1..PNG_CACHE_MAX_ENTRIES (0 or negative is an error, the cache
+//              can never be disabled by setting its size to 0)
+// iPolicy:     PNG_CACHE_LRU or PNG_CACHE_FIFO
+// iThreads:    1..16, number of worker threads the application will use;
+//              recorded so multi-threaded sharing can be verified
+// Reconfiguring flushes the table and resets the statistics.
+//
+int PNG_cache_configure(int iMaxEntries, int iPolicy, int iThreads)
+{
+    if (iMaxEntries <= 0 || iMaxEntries > PNG_CACHE_MAX_ENTRIES)
+        return PNG_INVALID_PARAMETER;
+    if (iPolicy != PNG_CACHE_LRU && iPolicy != PNG_CACHE_FIFO)
+        return PNG_INVALID_PARAMETER;
+    if (iThreads < 1 || iThreads > 16)
+        return PNG_INVALID_PARAMETER;
+    PNGCacheLock();
+    PNGCacheCapacity = iMaxEntries;
+    PNGCachePolicy = iPolicy;
+    PNGCacheThreads = iThreads;
+    memset(PNGCacheTable, 0, sizeof(PNGCacheTable));
+    PNGCacheTick = PNGCacheHits = PNGCacheMisses = 0;
+    PNGCacheParseCount = PNGCacheEvictions = 0;
+    PNGCacheUnlock();
+    return PNG_SUCCESS;
+} /* PNG_cache_configure() */
+
+// Empty the cache and zero all statistics.
+void PNG_cache_reset(void)
+{
+    PNGCacheLock();
+    memset(PNGCacheTable, 0, sizeof(PNGCacheTable));
+    PNGCacheTick = PNGCacheHits = PNGCacheMisses = 0;
+    PNGCacheParseCount = PNGCacheEvictions = 0;
+    PNGCacheUnlock();
+} /* PNG_cache_reset() */
+
+//
+// Snapshot the cache statistics. Any pointer may be NULL.
+// Hits/misses count open() lookups; parses counts full header parses;
+// entries is the number currently occupied.
+//
+int PNG_cache_stats(int *pHits, int *pMisses, int *pParses,
+                    int *pEvictions, int *pEntries, int *pCapacity)
+{
+    int i, iUsed = 0;
+    PNGCacheLock();
+    for (i = 0; i < PNGCacheCapacity; i++)
+        iUsed += PNGCacheTable[i].iInUse;
+    if (pHits) *pHits = (int)PNGCacheHits;
+    if (pMisses) *pMisses = (int)PNGCacheMisses;
+    if (pParses) *pParses = (int)PNGCacheParseCount;
+    if (pEvictions) *pEvictions = (int)PNGCacheEvictions;
+    if (pEntries) *pEntries = iUsed;
+    if (pCapacity) *pCapacity = PNGCacheCapacity;
+    PNGCacheUnlock();
+    return PNG_SUCCESS;
+} /* PNG_cache_stats() */
+#ifdef __cplusplus
+}
+#endif
 //
 // De-filter the current line of pixels
 //
@@ -798,7 +1160,7 @@ PNG_STATIC void DeFilter(uint8_t *pCurr, uint8_t *pPrev, int iWidth, int iPitch)
 //
 PNG_STATIC int PNGInit(PNGIMAGE *pPNG)
 {
-    return PNGParseInfo(pPNG); // gather info for image
+    return PNGCacheOpen(pPNG); // parse (or reuse the cached) image header info
 } /* PNGInit() */
 //
 // Decode the PNG file
