@@ -64,6 +64,10 @@ static const uint16_t usGrayTo565[] = {0x0000,0x0000,0x0000,0x0000,0x0020,0x0020
 PNG_STATIC int32_t readFLASH(PNGFILE *pFile, uint8_t *pBuf, int32_t iLen);
 PNG_STATIC int32_t seekMem(PNGFILE *pFile, int32_t iPosition);
 PNG_STATIC int PNGInit(PNGIMAGE *pPNG);
+PNG_STATIC int PNGRingSetBuffer(PNGIMAGE *pPNG, uint8_t *pBuffer, int iLines);
+PNG_STATIC int PNGRingSetPrefetch(PNGIMAGE *pPNG, int iLines);
+PNG_STATIC int PNGRingGetBufferSize(PNGIMAGE *pPNG, int iLines);
+PNG_STATIC uint8_t *PNGRingGetLine(PNGIMAGE *pPNG, int y);
 
 // C API
 int PNG_openRAM(PNGIMAGE *pPNG, uint8_t *pData, int iDataSize, PNG_DRAW_CALLBACK *pfnDraw)
@@ -147,6 +151,26 @@ uint8_t * PNG_getBuffer(PNGIMAGE *pPNG)
 {
     return pPNG->pImage;
 } /* PNG_getBuffer() */
+
+int PNG_setRingBuffer(PNGIMAGE *pPNG, uint8_t *pBuffer, int iLines)
+{
+    return PNGRingSetBuffer(pPNG, pBuffer, iLines);
+} /* PNG_setRingBuffer() */
+
+int PNG_setRingPrefetch(PNGIMAGE *pPNG, int iLines)
+{
+    return PNGRingSetPrefetch(pPNG, iLines);
+} /* PNG_setRingPrefetch() */
+
+int PNG_getRingBufferSize(PNGIMAGE *pPNG, int iLines)
+{
+    return PNGRingGetBufferSize(pPNG, iLines);
+} /* PNG_getRingBufferSize() */
+
+uint8_t *PNG_getRingLine(PNGIMAGE *pPNG, int y)
+{
+    return PNGRingGetLine(pPNG, y);
+} /* PNG_getRingLine() */
 
 #endif // !__cplusplus
 PNG_STATIC uint8_t PNGMakeMask(PNGDRAW *pDraw, uint8_t *pMask, uint8_t ucThreshold)
@@ -801,6 +825,88 @@ PNG_STATIC int PNGInit(PNGIMAGE *pPNG)
     return PNGParseInfo(pPNG); // gather info for image
 } /* PNGInit() */
 //
+// Ring-buffer line output mode
+//
+// The ring holds the last N decoded lines (each slot is iPitch+1 bytes:
+// filter byte + pixels). Line y is decoded into slot (y % N); the slot is
+// recycled automatically once N newer lines have been decoded. Lines are
+// handed to the draw callback once P further lines have been decoded
+// (prefetch/lookahead), so at callback time for line y the ring still
+// holds lines y-(N-1-P) .. y+P. PNG filters only ever look back 1 line,
+// so N >= 2 always suffices to decode; with N == 1 the previous line is
+// gone and lines filtered with Up/Average/Paeth cannot be inverted
+// (decode fails with PNG_RING_TOO_SMALL); None/Sub still work.
+//
+PNG_STATIC int PNGRingSetBuffer(PNGIMAGE *pPNG, uint8_t *pBuffer, int iLines)
+{
+    if (pBuffer == NULL) { // NULL disables ring mode (legacy 2-line mode)
+        pPNG->pRing = NULL;
+        pPNG->iRingLines = 0;
+        return PNG_SUCCESS;
+    }
+    if (iLines < 1)
+        return PNG_INVALID_PARAMETER;
+    pPNG->pRing = pBuffer;
+    pPNG->iRingLines = iLines;
+    pPNG->iRingStride = pPNG->iPitch + 1;
+    return PNG_SUCCESS;
+} /* PNGRingSetBuffer() */
+
+PNG_STATIC int PNGRingSetPrefetch(PNGIMAGE *pPNG, int iLines)
+{
+    if (iLines < 0)
+        return PNG_INVALID_PARAMETER;
+    pPNG->iRingPrefetch = iLines;
+    return PNG_SUCCESS;
+} /* PNGRingSetPrefetch() */
+
+PNG_STATIC int PNGRingGetBufferSize(PNGIMAGE *pPNG, int iLines)
+{
+    if (iLines < 1)
+        return 0;
+    return iLines * (pPNG->iPitch + 1);
+} /* PNGRingGetBufferSize() */
+
+PNG_STATIC uint8_t *PNGRingGetLine(PNGIMAGE *pPNG, int y)
+{
+    if (pPNG->pRing == NULL || pPNG->iRingStride == 0)
+        return NULL;
+    if (y < 0 || y >= pPNG->iRingDecoded || y < pPNG->iRingDecoded - pPNG->iRingLines)
+        return NULL; // line has been recycled or not decoded yet
+    return &pPNG->pRing[(y % pPNG->iRingLines) * pPNG->iRingStride] + 1; // +1 to skip the filter byte
+} /* PNGRingGetLine() */
+//
+// Hand off every decoded line which is ready (respecting the prefetch
+// depth) to the draw callback. With bFlush == TRUE, all remaining decoded
+// lines are emitted (end of image). Returns 0 if the callback asked to
+// stop (PNG_QUIT_EARLY).
+//
+PNG_STATIC int PNGRingEmitReady(PNGIMAGE *pPage, void *pUser, int iOptions, int bFlush)
+{
+    PNGDRAW pngd;
+
+    while (pPage->iRingEmitted < pPage->iRingDecoded &&
+           (bFlush || pPage->iRingEmitted <= pPage->iRingDecoded - 1 - pPage->iRingPrefetch)) {
+        int y = pPage->iRingEmitted;
+        pngd.pUser = pUser;
+        pngd.iPitch = pPage->iPitch;
+        pngd.iWidth = pPage->iWidth;
+        pngd.pPalette = pPage->ucPalette;
+        pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512] : NULL;
+        pngd.pPixels = &pPage->pRing[(y % pPage->iRingLines) * pPage->iRingStride] + 1;
+        pngd.iPixelType = pPage->ucPixelType;
+        pngd.iHasAlpha = pPage->iHasAlpha;
+        pngd.iBpp = pPage->ucBpp;
+        pngd.y = y;
+        pPage->iRingEmitted++;
+        if (!(*pPage->pfnDraw)(&pngd)) {
+            pPage->iError = PNG_QUIT_EARLY;
+            return 0;
+        }
+    }
+    return 1;
+} /* PNGRingEmitReady() */
+//
 // Decode the PNG file
 //
 // You must call open() before calling decode()
@@ -811,17 +917,31 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
 {
     int err, y, iLen=0;
     int bDone, iOffset, iFileOffset, iBytesRead, iAvailable;
-    int iMarker=0;
+    int iMarker=0, iRingMode;
     uint8_t *tmp, *pCurr, *pPrev;
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
-    
+
     // Either the image buffer must be allocated or a draw callback must be set before entering
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
         pPage->iError = PNG_NO_BUFFER;
         return 0;
     }
+    // Ring-buffer mode: user supplied line ring + draw callback, no full image buffer
+    iRingMode = (pPage->pRing != NULL && pPage->pImage == NULL && pPage->pfnDraw != NULL);
+    if (iRingMode) {
+        if (pPage->iRingLines < 1 || pPage->iRingPrefetch < 0 ||
+            pPage->iRingLines < pPage->iRingPrefetch + 1) { // need N >= P+1 so slots are recycled only after hand-off
+            pPage->iError = PNG_INVALID_PARAMETER;
+            return 1;
+        }
+        pPage->iRingStride = pPage->iPitch + 1;
+        pPage->iRingDecoded = pPage->iRingEmitted = 0;
+        memset(pPage->ucPixels, 0, pPage->iPitch + 1); // zeroed line acts as "line -1" for the first line's filter
+        pCurr = &pPage->pRing[0];
+        pPrev = &pPage->ucPixels[0];
+    } else {
     // Use internal buffer to maintain the current and previous lines
     y = (int)(intptr_t)&pPage->ucPixels[0];
     y &= 15; // make sure we're 16-byte aligned, -1 for filter byte
@@ -830,6 +950,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     y += pPage->iPitch + 1; // both lines are 16-byte (minus 1)
     y += (15 - (y & 15));
     pPrev = &pPage->ucPixels[y];
+    }
     pPage->iError = PNG_SUCCESS;
     // Start decoding the image
     bDone = FALSE;
@@ -935,7 +1056,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 }
                 break;
             case 0x49444154: //'IDAT' image data block
-                while (iLen) {
+                while (iLen && !bDone) {
                     if (iOffset >= iBytesRead) {
                         // we ran out of data; get some more
                         iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, pPage->ucFileBuf, (iLen > PNG_FILE_BUF_SIZE) ? PNG_FILE_BUF_SIZE : iLen);
@@ -964,13 +1085,39 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
             //            d_stream.avail_in -= 4;
             //        }
                     err = 0;
-                    while (err == Z_OK) {
+                    while (err == Z_OK && !bDone) {
                         if (d_stream.avail_out == 0) { // reset for next line
                             d_stream.avail_out = pPage->iPitch+1;
                             d_stream.next_out = pCurr;
                         } // otherwise it could be a continuation of an unfinished line
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
                         if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
+                            if (iRingMode) {
+                                int bFilterOK = TRUE;
+                                if (y == 0) {
+                                    pPrev = &pPage->ucPixels[0]; // zeroed "line -1"
+                                } else if (pPage->iRingLines > 1) {
+                                    pPrev = &pPage->pRing[((y-1) % pPage->iRingLines) * pPage->iRingStride];
+                                } else { // ring size 1: the previous line has already been recycled
+                                    uint8_t ucF = pCurr[0]; // the filter byte of this line
+                                    if (ucF == PNG_FILTER_UP || ucF == PNG_FILTER_AVG || ucF == PNG_FILTER_PAETH) {
+                                        // these filters need the previous line to be inverted
+                                        pPage->iError = PNG_RING_TOO_SMALL;
+                                        bDone = TRUE;
+                                        bFilterOK = FALSE;
+                                    }
+                                    pPrev = &pPage->ucPixels[0]; // unused by None/Sub filters
+                                }
+                                if (bFilterOK) {
+                                    DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
+                                    y++;
+                                    pPage->iRingDecoded = y;
+                                    if (!PNGRingEmitReady(pPage, pUser, iOptions, FALSE)) // hand off ready lines
+                                        bDone = TRUE; // callback asked to stop
+                                    // the next line goes into the next ring slot, recycling the oldest
+                                    pCurr = &pPage->pRing[(y % pPage->iRingLines) * pPage->iRingStride];
+                                }
+                            } else {
                             DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
                             if (pPage->pImage == NULL) { // no image buffer, send it line by line
                                 PNGDRAW pngd;
@@ -995,6 +1142,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                             y++;
                         // swap current and previous lines
                         tmp = pCurr; pCurr = pPrev; pPrev = tmp;
+                            }
                         } else { // some error
                             tmp = NULL;
                         }
@@ -1052,6 +1200,10 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
         } // switch
         iOffset += (iLen + 4); // skip data + CRC
     } // while y < height
+    if (iRingMode && pPage->iError == PNG_SUCCESS) {
+        // flush any prefetched lines still waiting in the ring
+        PNGRingEmitReady(pPage, pUser, iOptions, TRUE);
+    }
     err = inflateEnd(&d_stream);
     return pPage->iError;
 } /* DecodePNG() */

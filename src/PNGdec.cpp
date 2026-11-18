@@ -169,6 +169,37 @@ uint8_t * PNG::getBuffer()
     return _png.pImage;
 } /* getBuffer() */
 //
+// Enable ring-buffer line output mode with a user supplied buffer holding
+// iLines lines. Pass NULL to disable. See PNGdec.h for details.
+//
+int PNG::setRingBuffer(uint8_t *pBuffer, int iLines)
+{
+    return PNGRingSetBuffer(&_png, pBuffer, iLines);
+} /* setRingBuffer() */
+//
+// Set the number of lines decoded ahead before they are handed to the
+// draw callback (0 = hand off each line as soon as it is decoded)
+//
+int PNG::setRingPrefetch(int iLines)
+{
+    return PNGRingSetPrefetch(&_png, iLines);
+} /* setRingPrefetch() */
+//
+// Returns the size in bytes of the ring buffer needed for iLines lines
+//
+int PNG::getRingBufferSize(int iLines)
+{
+    return PNGRingGetBufferSize(&_png, iLines);
+} /* getRingBufferSize() */
+//
+// Returns a pointer to the pixels of ring line y or NULL if that line has
+// already been recycled / not decoded yet
+//
+uint8_t * PNG::getRingLine(int y)
+{
+    return PNGRingGetLine(&_png, y);
+} /* getRingLine() */
+//
 // Returns the size in bytes of the buffer needed to hold the uncompressed image
 //
 int PNG::getBufferSize()

@@ -24,6 +24,7 @@ Feature summary:<br>
 - Runs on any MCU with at least 48K of free RAM<br>
 - No external dependencies (including malloc/free)<br>
 - Decode an image line by line with a callback function<br>
+- Optional ring-buffer line mode (setRingBuffer): keeps only the last N lines in a user supplied buffer, hands off each decoded line and recycles its slot. Ring size N and prefetch depth P are configurable (N >= P+1); getRingLine(y) looks back at retained lines. With N == 1 the previous line is not kept, so lines filtered with Up/Average/Paeth cannot be inverted and decode fails with PNG_RING_TOO_SMALL (None/Sub still work)<br>
 - Decode an image to a user supplied buffer (no callback needed)<br>
 - Supports all standard options except interlacing (too much RAM needed)<br>
 - Function provided to turn any pixel format into RGB565 for LCD displays<br>

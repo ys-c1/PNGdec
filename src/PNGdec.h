@@ -98,7 +98,8 @@ enum {
     PNG_UNSUPPORTED_FEATURE,
     PNG_INVALID_FILE,
     PNG_TOO_BIG,
-    PNG_QUIT_EARLY
+    PNG_QUIT_EARLY,
+    PNG_RING_TOO_SMALL // ring buffer too small to invert this line's filter
 };
 
 typedef struct png_file_tag
@@ -168,6 +169,13 @@ typedef struct png_image_tag
     uint8_t ucPixels[PNG_MAX_BUFFERED_PIXELS];
     uint8_t ucFileBuf[PNG_FILE_BUF_SIZE]; // holds temp file data
     char szComment[PNG_COMMENT_SIZE];
+    // Ring-buffer line output mode (optional, user supplied memory)
+    uint8_t *pRing;      // user supplied ring buffer, NULL = disabled (legacy 2-line mode)
+    int iRingLines;      // N = number of lines the ring can hold (>= 1)
+    int iRingPrefetch;   // P = lines decoded ahead before they are handed off (>= 0, N >= P+1)
+    int iRingStride;     // bytes per ring slot (iPitch+1)
+    int iRingDecoded;    // lines decoded so far (internal state)
+    int iRingEmitted;    // lines handed to the callback so far (internal state)
 } PNGIMAGE;
 
 #ifdef __cplusplus
@@ -196,6 +204,22 @@ class PNG
     char *getComment();
     uint8_t *getBuffer();
     void setBuffer(uint8_t *pBuffer);
+    // Ring-buffer line output mode: keeps only the last N decoded lines in a
+    // user supplied buffer. Each line is handed to the draw callback as it
+    // becomes ready and its slot is recycled N lines later. Use
+    // getRingBufferSize() to size the buffer. Requires a draw callback and
+    // no image buffer (setBuffer). Ring size N and prefetch P are
+    // configurable: N >= 1, P >= 0 and N >= P+1. At callback time for line
+    // y, lines y-P .. y+P are decoded and lines y-(N-1-P) .. y are still in
+    // the ring (see getRingLine). With N == 1 the previous line is not
+    // retained, so lines filtered with Up/Average/Paeth cannot be inverted
+    // and decode() fails with PNG_RING_TOO_SMALL (None/Sub still work).
+    int setRingBuffer(uint8_t *pBuffer, int iLines);
+    int setRingPrefetch(int iLines);
+    int getRingBufferSize(int iLines);
+    // Returns a pointer to the pixels of ring line y (no filter byte) or
+    // NULL if that line has already been recycled / not decoded yet.
+    uint8_t *getRingLine(int y);
     uint8_t getAlphaMask(PNGDRAW *pDraw, uint8_t *pMask, uint8_t ucThreshold);
     void getLineAsRGB565(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd);
 
@@ -220,6 +244,10 @@ int PNG_hasAlpha(PNGIMAGE *pPNG);
 int PNG_isInterlaced(PNGIMAGE *pPNG);
 uint8_t *PNG_getBuffer(PNGIMAGE *pPNG);
 void PNG_setBuffer(PNGIMAGE *pPNG, uint8_t *pBuffer);
+int PNG_setRingBuffer(PNGIMAGE *pPNG, uint8_t *pBuffer, int iLines);
+int PNG_setRingPrefetch(PNGIMAGE *pPNG, int iLines);
+int PNG_getRingBufferSize(PNGIMAGE *pPNG, int iLines);
+uint8_t *PNG_getRingLine(PNGIMAGE *pPNG, int y);
 #endif // __cplusplus
 
 // Due to unaligned memory causing an exception, we have to do these macros the slow way
