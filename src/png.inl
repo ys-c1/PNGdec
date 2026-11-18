@@ -250,331 +250,512 @@ void s3_rgb565(uint8_t *pSrc, uint8_t *pDest, int iCount, bool bBigEndian);
 #endif
 //
 // Convert a line of native PNG pixels into RGB565
-// handles all standard pixel types
-// written for simplicity, not necessarily performance
+// Descriptor-table driven: each supported pixel format is described by a
+// PNG_FMT_DESC entry (pixel type, bit depth, channel count, flags and a
+// pointer to its line-conversion function). PNGRGB565() simply looks up
+// the matching descriptor and calls its function. Adding support for a new
+// pixel format = adding one conversion function + one table entry.
 //
-PNG_STATIC void PNGRGB565(PNGDRAW *pDraw, uint16_t *pPixels, int iEndiannes, uint32_t u32Bkgd, int iHasAlpha)
+// Runtime modifiers which are orthogonal to the pixel format (output
+// endianness and background color) are passed as arguments; the
+// "fast RGB565 palette" modifier selects a parallel set of table entries
+// (PNG_FMT_FASTPAL flag) because it changes which conversion applies.
+//
+typedef void (PNG_CONVERT_LINE)(PNGDRAW *pDraw, uint16_t *pDest, int iEndianness, uint32_t u32Bkgd);
+
+// Flags for PNG_FMT_DESC.ucFlags
+enum {
+    PNG_FMT_PALETTE = 1, // pixels are indices into a palette
+    PNG_FMT_ALPHA   = 2, // format carries per-pixel alpha
+    PNG_FMT_FASTPAL = 4  // convert through the pre-decoded RGB565 palette
+};
+
+typedef struct {
+    uint8_t ucPixelType;          // PNG pixel type (PNG_PIXEL_*)
+    uint8_t ucBpp;                // bits per pixel
+    uint8_t ucChannels;           // color samples per pixel
+    uint8_t ucFlags;              // PNG_FMT_* flags
+    PNG_CONVERT_LINE *pfnConvert; // single-line conversion function
+} PNG_FMT_DESC;
+
+PNG_STATIC void ConvGrayAlpha(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
 {
-    int x, j;
+    int x;
     uint16_t usPixel, *pDest = pPixels;
-    uint8_t c=0, a, *pPal, *s = pDraw->pPixels;
-    
-    switch (pDraw->iPixelType) {
-        case PNG_PIXEL_GRAY_ALPHA:
-            if (u32Bkgd != 0xffffffff) {
-                // gray level of background color choice
-                uint8_t u8BG = (uint8_t)(((u32Bkgd & 0xff) + ((u32Bkgd >> 7) & 0x1fe) + ((u32Bkgd >> 16) & 0xff)) / 4);
-                uint16_t usBG = usGrayTo565[u8BG];
-                for (x=0; x<pDraw->iWidth; x++) {
-                    c = *s++; // gray level
-                    a = *s++;
-                    if (a == 0) {
-                        usPixel = usBG;
-                    } else if (a == 255) { // fully opaque
-                        usPixel = usGrayTo565[c];
-                    } else { // mix the colors
-                        usPixel = (c * a) + (u8BG * (255-a));
-                        usPixel = usGrayTo565[(usPixel >> 8)];
-                    }
-                    if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                        usPixel = __builtin_bswap16(usPixel);
-                    *pDest++ = usPixel;
-                } // for x
-            } else {
-                for (x=0; x<pDraw->iWidth; x++) {
-                    c = *s++; // gray level
-                    a = *s++;
-                    j = (a * c) >> 8; // multiply by the alpha
-                    usPixel = usGrayTo565[j];
-                    if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                        usPixel = __builtin_bswap16(usPixel);
-                    *pDest++ = usPixel;
-                }
+    uint8_t c, a, *s = pDraw->pPixels;
+
+    if (u32Bkgd != 0xffffffff) {
+        // gray level of background color choice
+        uint8_t u8BG = (uint8_t)(((u32Bkgd & 0xff) + ((u32Bkgd >> 7) & 0x1fe) + ((u32Bkgd >> 16) & 0xff)) / 4);
+        uint16_t usBG = usGrayTo565[u8BG];
+        for (x=0; x<pDraw->iWidth; x++) {
+            c = *s++; // gray level
+            a = *s++;
+            if (a == 0) {
+                usPixel = usBG;
+            } else if (a == 255) { // fully opaque
+                usPixel = usGrayTo565[c];
+            } else { // mix the colors
+                usPixel = (c * a) + (u8BG * (255-a));
+                usPixel = usGrayTo565[(usPixel >> 8)];
             }
-            break;
-        case PNG_PIXEL_GRAYSCALE:
-            switch (pDraw->iBpp) {
-               case 8:
-                for (x=0; x<pDraw->iWidth; x++) {
-                    c = *s++;
-                    usPixel = (c >> 3); // blue
-                    usPixel |= ((c >> 2) << 5); // green
-                    usPixel |= ((c >> 3) << 11); // red
-                    if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                        usPixel = __builtin_bswap16(usPixel);
-                    *pDest++ = usPixel;
-                }
-                break;
-               case 4:
-                for (x=0; x<pDraw->iWidth; x+=2) {
-                    uint8_t d;
-                    d = *s++;
-                    c = (d & 0xf0) | (d >> 4); // left pixel
-                    usPixel = (c >> 3); // blue
-                    usPixel |= ((c >> 2) << 5); // green
-                    usPixel |= ((c >> 3) << 11); // red
-                    if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                        usPixel = __builtin_bswap16(usPixel);
-                    *pDest++ = usPixel;
-                    c = (d & 0xf) | (d << 4); // right pixel
-                    usPixel = (c >> 3); // blue 
-                    usPixel |= ((c >> 2) << 5); // green
-                    usPixel |= ((c >> 3) << 11); // red
-                    if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                        usPixel = __builtin_bswap16(usPixel);
-                    *pDest++ = usPixel;
-                }
-                break;
-                case 2:
-                {
-                   const uint16_t us2Bit[4] = {0x0000, 0x39e7, 0x7bef, 0xffff};
-                   for (x=0; x<pDraw->iWidth; x++) {
-                       if ((x & 3) == 0) {
-                           c = *s++;
-                       }
-                       usPixel = us2Bit[c >> 6];
-                       if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                           usPixel = __builtin_bswap16(usPixel);
-                       *pDest++ = usPixel;
-                       c <<= 2;
-                   } // for x
-                }
-                break;
-                case 1:
-                   for (x=0; x<pDraw->iWidth; x++) {
-                       if ((x & 7) == 0) {
-                           c = *s++;
-                       }
-                       if (c & 0x80) {
-                           usPixel = 0xffff;
-                       } else {
-                           usPixel = 0;
-                       }
-                       *pDest++ = usPixel;
-                       c <<= 1;
-                   }
-                break;
-            } // switch on bpp
-            break;
-        case PNG_PIXEL_TRUECOLOR:
-            for (x=0; x<pDraw->iWidth; x++) {
+            if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                usPixel = __builtin_bswap16(usPixel);
+            *pDest++ = usPixel;
+        } // for x
+    } else {
+        for (x=0; x<pDraw->iWidth; x++) {
+            int j;
+            c = *s++; // gray level
+            a = *s++;
+            j = (a * c) >> 8; // multiply by the alpha
+            usPixel = usGrayTo565[j];
+            if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                usPixel = __builtin_bswap16(usPixel);
+            *pDest++ = usPixel;
+        }
+    }
+} /* ConvGrayAlpha() */
+
+PNG_STATIC void ConvGray8(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        c = *s++;
+        usPixel = (c >> 3); // blue
+        usPixel |= ((c >> 2) << 5); // green
+        usPixel |= ((c >> 3) << 11); // red
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+    }
+} /* ConvGray8() */
+
+PNG_STATIC void ConvGray4(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x+=2) {
+        uint8_t d;
+        d = *s++;
+        c = (d & 0xf0) | (d >> 4); // left pixel
+        usPixel = (c >> 3); // blue
+        usPixel |= ((c >> 2) << 5); // green
+        usPixel |= ((c >> 3) << 11); // red
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+        c = (d & 0xf) | (d << 4); // right pixel
+        usPixel = (c >> 3); // blue
+        usPixel |= ((c >> 2) << 5); // green
+        usPixel |= ((c >> 3) << 11); // red
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+    }
+} /* ConvGray4() */
+
+PNG_STATIC void ConvGray2(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c = 0, *s = pDraw->pPixels;
+    const uint16_t us2Bit[4] = {0x0000, 0x39e7, 0x7bef, 0xffff};
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        if ((x & 3) == 0) {
+            c = *s++;
+        }
+        usPixel = us2Bit[c >> 6];
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+        c <<= 2;
+    } // for x
+} /* ConvGray2() */
+
+PNG_STATIC void ConvGray1(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c = 0, *s = pDraw->pPixels;
+    (void)iEndianness; // 0x0000/0xffff are endian-neutral
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        if ((x & 7) == 0) {
+            c = *s++;
+        }
+        if (c & 0x80) {
+            usPixel = 0xffff;
+        } else {
+            usPixel = 0;
+        }
+        *pDest++ = usPixel;
+        c <<= 1;
+    }
+} /* ConvGray1() */
+
+PNG_STATIC void ConvTrueColor(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        usPixel = (s[2] >> 3); // blue
+        usPixel |= ((s[1] >> 2) << 5); // green
+        usPixel |= ((s[0] >> 3) << 11); // red
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+        s += 3;
+    }
+} /* ConvTrueColor() */
+
+PNG_STATIC void ConvTrueColorAlpha(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t *s = pDraw->pPixels;
+
+    if (u32Bkgd != 0xffffffff) { // user wants to blend it with a background color
+        uint32_t r, g, b, a;
+        uint32_t b_r, b_g, b_b;
+        b_r = u32Bkgd & 0xff; b_g = (u32Bkgd & 0xff00) >> 8;
+        b_b = (u32Bkgd >> 16) & 0xff;
+        uint16_t u16Clr = (u32Bkgd & 0xf8) << 8;
+        u16Clr |= ((u32Bkgd & 0xfc00) >> 5);
+        u16Clr |= ((u32Bkgd & 0xf80000) >> 19);
+        for (x=0; x<pDraw->iWidth; x++) {
+            r = s[0]; g = s[1]; b = s[2]; a = s[3];
+            if (a == 0)
+                usPixel = u16Clr;
+            else if (a == 255) { // fully opaque
                 usPixel = (s[2] >> 3); // blue
                 usPixel |= ((s[1] >> 2) << 5); // green
                 usPixel |= ((s[0] >> 3) << 11); // red
-                if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
+            } else { // mix the colors
+                r = ((r * a) + (b_r * (255-a))) >> 8;
+                g = ((g * a) + (b_g * (255-a))) >> 8;
+                b = ((b * a) + (b_b * (255-a))) >> 8;
+                usPixel = (b >> 3); // blue
+                usPixel |= ((g >> 2) << 5); // green
+                usPixel |= ((r >> 3) << 11); // red
+            }
+            if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                usPixel = __builtin_bswap16(usPixel);
+            *pDest++ = usPixel;
+            s += 4; // skip alpha
+        }
+    } else { // ignore alpha
+#ifdef ARDUINO_ESP32S3_DEV
+        s3_rgb565(s, (uint8_t *)pDest, pDraw->iWidth, (iEndianness == PNG_RGB565_BIG_ENDIAN));
+#else
+        for (x=0; x<pDraw->iWidth; x++) {
+            usPixel = (s[2] >> 3); // blue
+            usPixel |= ((s[1] >> 2) << 5); // green
+            usPixel |= ((s[0] >> 3) << 11); // red
+            if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                usPixel = __builtin_bswap16(usPixel);
+            *pDest++ = usPixel;
+            s += 4; // skip alpha
+        }
+#endif
+    }
+} /* ConvTrueColorAlpha() */
+
+//
+// Indexed (palette) formats, fast path: use the pre-decoded RGB565 palette
+//
+PNG_STATIC void ConvIndexed8Fast(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        c = *s++;
+        usPixel = pDraw->pFastPalette[c];
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+    }
+} /* ConvIndexed8Fast() */
+
+PNG_STATIC void ConvIndexed4Fast(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x+=2) {
+        c = *s++;
+        usPixel = pDraw->pFastPalette[c >> 4];
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+        usPixel = pDraw->pFastPalette[c & 0xf];
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+    }
+} /* ConvIndexed4Fast() */
+
+PNG_STATIC void ConvIndexed2Fast(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x, j;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x+=4) {
+        c = *s++;
+        for (j=0; j<4; j++) { // work on pairs of bits
+            usPixel = pDraw->pFastPalette[c >> 6];
+            if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                usPixel = __builtin_bswap16(usPixel);
+            *pDest++ = usPixel;
+            c <<= 2;
+        }
+    }
+} /* ConvIndexed2Fast() */
+
+PNG_STATIC void ConvIndexed1Fast(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c = 0, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        if ((x & 7) == 0) {
+            c = *s++;
+        }
+        usPixel = pDraw->pFastPalette[c >> 7];
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+        c <<= 1;
+    }
+} /* ConvIndexed1Fast() */
+
+//
+// Indexed (palette) formats, normal path: convert through the RGB palette
+//
+PNG_STATIC void ConvIndexed8(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *pPal, *s = pDraw->pPixels;
+
+    // 8-bit palette also supports palette alpha
+    if (pDraw->iHasAlpha) { // use the alpha to modify the palette
+        if (u32Bkgd != 0xffffffff) { // user wants to blend it with a background color
+            uint32_t b_r, b_g, b_b;
+            b_r = u32Bkgd & 0xff; b_g = (u32Bkgd & 0xff00) >> 8;
+            b_b = (u32Bkgd >> 16) & 0xff;
+            uint16_t u16Clr = (u32Bkgd & 0xf8) << 8;
+            u16Clr |= ((u32Bkgd & 0xfc00) >> 5);
+            u16Clr |= ((u32Bkgd & 0xf80000) >> 19);
+            for (x=0; x<pDraw->iWidth; x++) {
+                int a;
+                c = *s++;
+                a = pDraw->pPalette[768+c]; // get alpha
+                if (a == 0) { // pure BGColor
+                    usPixel = u16Clr;
+                } else if (a == 255) { // opaque
+                    pPal = &pDraw->pPalette[c * 3];
+                    usPixel = ((pPal[2] * a) >> 11); // blue
+                    usPixel |= (((pPal[1] * a) >> 10) << 5); // green
+                    usPixel |= (((pPal[0] * a) >> 11) << 11); // red
+                } else { // need to mix the bg & fg colors
+
+                    pPal = &pDraw->pPalette[c * 3];
+                    usPixel = ((((pPal[2] * a) + (b_b * (255-a)))) >> 11); // blue
+                    usPixel |= ((((pPal[1] * a) + (b_g * (255-a)))>> 10) << 5); // green
+                    usPixel |= ((((pPal[0] * a) + (b_r * (255-a)))>> 11) << 11); // red
+                } // need to mix with alpha
+                if (iEndianness == PNG_RGB565_BIG_ENDIAN)
                     usPixel = __builtin_bswap16(usPixel);
                 *pDest++ = usPixel;
-                s += 3;
-            }
-            break;
-        case PNG_PIXEL_INDEXED: // palette color (can be 1/2/4 or 8 bits per pixel)
-            if (pDraw->pFastPalette && !pDraw->iHasAlpha) { // faster RGB565 palette exists
-               switch (pDraw->iBpp) {
-                   case 8:
-                       for (x=0; x<pDraw->iWidth; x++) {
-                           c = *s++;
-                           usPixel = pDraw->pFastPalette[c];
-                           if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                               usPixel = __builtin_bswap16(usPixel);
-                           *pDest++ = usPixel;
-                       }
-                       break;
-                   case 4:
-                       for (x=0; x<pDraw->iWidth; x+=2) {
-                           c = *s++;
-                           usPixel = pDraw->pFastPalette[c >> 4];
-                           if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                               usPixel = __builtin_bswap16(usPixel);
-                           *pDest++ = usPixel;
-                           usPixel = pDraw->pFastPalette[c & 0xf];
-                           if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                               usPixel = __builtin_bswap16(usPixel);
-                           *pDest++ = usPixel;
-                       }
-                       break;
-                   case 2:
-                       for (x=0; x<pDraw->iWidth; x+=4) {
-                           c = *s++;
-                           for (j=0; j<4; j++) { // work on pairs of bits
-                               usPixel = pDraw->pFastPalette[c >> 6];
-                               if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                                   usPixel = __builtin_bswap16(usPixel);
-                               *pDest++ = usPixel;
-                               c <<= 2;
-                           }
-                       }
-                       break;
-                   case 1:
-                       for (x=0; x<pDraw->iWidth; x++) {
-                           if ((x & 7) == 0) {
-                               c = *s++;
-                           }
-                           usPixel = pDraw->pFastPalette[c >> 7];
-                           if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                               usPixel = __builtin_bswap16(usPixel);
-                           *pDest++ = usPixel;
-                           c <<= 1;
-                       }
-                       break;
-               } // switch on bpp 
-               return;
-            }
-            switch (pDraw->iBpp) {
-                case 8: // 8-bit palette also supports palette alpha
-                    if (pDraw->iHasAlpha) { // use the alpha to modify the palette
-                        if (u32Bkgd != 0xffffffff) { // user wants to blend it with a background color
-                            uint32_t b_r, b_g, b_b;
-                            b_r = u32Bkgd & 0xff; b_g = (u32Bkgd & 0xff00) >> 8;
-                            b_b = (u32Bkgd >> 16) & 0xff;
-                            uint16_t u16Clr = (u32Bkgd & 0xf8) << 8;
-                            u16Clr |= ((u32Bkgd & 0xfc00) >> 5);
-                            u16Clr |= ((u32Bkgd & 0xf80000) >> 19);
-                            for (x=0; x<pDraw->iWidth; x++) {
-                                int a;
-                                c = *s++;
-                                a = pDraw->pPalette[768+c]; // get alpha
-                                if (a == 0) { // pure BGColor
-                                    usPixel = u16Clr;
-                                } else if (a == 255) { // opaque
-                                    pPal = &pDraw->pPalette[c * 3];
-                                    usPixel = ((pPal[2] * a) >> 11); // blue
-                                    usPixel |= (((pPal[1] * a) >> 10) << 5); // green
-                                    usPixel |= (((pPal[0] * a) >> 11) << 11); // red
-                                } else { // need to mix the bg & fg colors
+            } // for x
+        } else { // alpha 0 = black
+            for (x=0; x<pDraw->iWidth; x++) {
+                int a;
+                c = *s++;
+                a = pDraw->pPalette[768+c]; // get alpha
+                pPal = &pDraw->pPalette[c * 3];
+                usPixel = ((pPal[2] * a) >> 11); // blue
+                usPixel |= (((pPal[1] * a) >> 10) << 5); // green
+                usPixel |= (((pPal[0] * a) >> 11) << 11); // red
+                if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                    usPixel = __builtin_bswap16(usPixel);
+                *pDest++ = usPixel;
+            } // for x
+        }
+    } else {
+        for (x=0; x<pDraw->iWidth; x++) {
+            c = *s++;
+            pPal = &pDraw->pPalette[c * 3];
+            usPixel = (pPal[2] >> 3); // blue
+            usPixel |= ((pPal[1] >> 2) << 5); // green
+            usPixel |= ((pPal[0] >> 3) << 11); // red
+            if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                usPixel = __builtin_bswap16(usPixel);
+            *pDest++ = usPixel;
+        } // for x
+    } // not alpha palette
+} /* ConvIndexed8() */
 
-                                    pPal = &pDraw->pPalette[c * 3];
-                                    usPixel = ((((pPal[2] * a) + (b_b * (255-a)))) >> 11); // blue 
-                                    usPixel |= ((((pPal[1] * a) + (b_g * (255-a)))>> 10) << 5); // green                                
-                                    usPixel |= ((((pPal[0] * a) + (b_r * (255-a)))>> 11) << 11); // red                                 
-                                } // need to mix with alpha
-                                if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                                    usPixel = __builtin_bswap16(usPixel);
-                                *pDest++ = usPixel;
-                            } // for x
-                        } else { // alpha 0 = black
-                            for (x=0; x<pDraw->iWidth; x++) {
-                                int a;
-                                c = *s++;
-                                a = pDraw->pPalette[768+c]; // get alpha
-                                pPal = &pDraw->pPalette[c * 3];
-                                usPixel = ((pPal[2] * a) >> 11); // blue
-                                usPixel |= (((pPal[1] * a) >> 10) << 5); // green
-                                usPixel |= (((pPal[0] * a) >> 11) << 11); // red
-                                if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                                    usPixel = __builtin_bswap16(usPixel);
-                                *pDest++ = usPixel;
-                            } // for x
-                        }
-                    } else {
-                        for (x=0; x<pDraw->iWidth; x++) {
-                            c = *s++;
-                            pPal = &pDraw->pPalette[c * 3];
-                            usPixel = (pPal[2] >> 3); // blue
-                            usPixel |= ((pPal[1] >> 2) << 5); // green
-                            usPixel |= ((pPal[0] >> 3) << 11); // red
-                            if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                                usPixel = __builtin_bswap16(usPixel);
-                            *pDest++ = usPixel;
-                        } // for x
-                    } // not alpha palette
-                    break;
-                case 4:
-                    for (x=0; x<pDraw->iWidth; x+=2) {
-                        c = *s++;
-                        pPal = &pDraw->pPalette[(c >> 4) * 3];
-                        usPixel = (pPal[2] >> 3); // blue
-                        usPixel |= ((pPal[1] >> 2) << 5); // green
-                        usPixel |= ((pPal[0] >> 3) << 11); // red
-                        if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                            usPixel = __builtin_bswap16(usPixel);
-                        *pDest++ = usPixel;
-                        pPal = &pDraw->pPalette[(c & 0xf) * 3];
-                        usPixel = (pPal[2] >> 3); // blue
-                        usPixel |= ((pPal[1] >> 2) << 5); // green
-                        usPixel |= ((pPal[0] >> 3) << 11); // red
-                        if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                            usPixel = __builtin_bswap16(usPixel);
-                        *pDest++ = usPixel;
-                    }
-                    break;
-                case 2:
-                    for (x=0; x<pDraw->iWidth; x+=4) {
-                        c = *s++;
-                        for (j=0; j<4; j++) { // work on pairs of bits
-                            pPal = &pDraw->pPalette[(c >> 6) * 3];
-                            usPixel = (pPal[2] >> 3); // blue
-                            usPixel |= ((pPal[1] >> 2) << 5); // green
-                            usPixel |= ((pPal[0] >> 3) << 11); // red
-                            if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                                usPixel = __builtin_bswap16(usPixel);
-                            *pDest++ = usPixel;
-                            c <<= 2;
-                        }
-                    }
-                    break;
-                case 1:
-                    for (x=0; x<pDraw->iWidth; x++) {
-                        if ((x & 7) == 0) {
-                            c = *s++;
-                        }
-                        pPal = &pDraw->pPalette[(c >> 7) * 3];
-                        usPixel = (pPal[2] >> 3); // blue
-                        usPixel |= ((pPal[1] >> 2) << 5); // green
-                        usPixel |= ((pPal[0] >> 3) << 11); // red
-                        if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                            usPixel = __builtin_bswap16(usPixel);
-                        *pDest++ = usPixel;
-                        c <<= 1;
-                    }
-                    break;
-            } // switch on bits per pixel
-            break;
-        case PNG_PIXEL_TRUECOLOR_ALPHA: // truecolor + alpha
-            if (u32Bkgd != 0xffffffff) { // user wants to blend it with a background color
-                uint32_t r, g, b, a;
-                uint32_t b_r, b_g, b_b;
-                b_r = u32Bkgd & 0xff; b_g = (u32Bkgd & 0xff00) >> 8;
-                b_b = (u32Bkgd >> 16) & 0xff;
-                uint16_t u16Clr = (u32Bkgd & 0xf8) << 8;
-                u16Clr |= ((u32Bkgd & 0xfc00) >> 5);
-                u16Clr |= ((u32Bkgd & 0xf80000) >> 19);
-                for (x=0; x<pDraw->iWidth; x++) {
-                    r = s[0]; g = s[1]; b = s[2]; a = s[3];
-                    if (a == 0)
-                        usPixel = u16Clr;
-                    else if (a == 255) { // fully opaque
-                        usPixel = (s[2] >> 3); // blue
-                        usPixel |= ((s[1] >> 2) << 5); // green
-                        usPixel |= ((s[0] >> 3) << 11); // red
-                    } else { // mix the colors
-                        r = ((r * a) + (b_r * (255-a))) >> 8;
-                        g = ((g * a) + (b_g * (255-a))) >> 8;
-                        b = ((b * a) + (b_b * (255-a))) >> 8;
-                        usPixel = (b >> 3); // blue
-                        usPixel |= ((g >> 2) << 5); // green
-                        usPixel |= ((r >> 3) << 11); // red
-                    }
-                    if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                        usPixel = __builtin_bswap16(usPixel);
-                    *pDest++ = usPixel;
-                    s += 4; // skip alpha
-                }
-            } else { // ignore alpha
-#ifdef ARDUINO_ESP32S3_DEV
-                s3_rgb565(s, (uint8_t *)pDest, pDraw->iWidth, (iEndiannes == PNG_RGB565_BIG_ENDIAN));
-#else
-                for (x=0; x<pDraw->iWidth; x++) {
-                    usPixel = (s[2] >> 3); // blue
-                    usPixel |= ((s[1] >> 2) << 5); // green
-                    usPixel |= ((s[0] >> 3) << 11); // red
-                    if (iEndiannes == PNG_RGB565_BIG_ENDIAN)
-                        usPixel = __builtin_bswap16(usPixel);
-                    *pDest++ = usPixel;
-                    s += 4; // skip alpha
-                }
-#endif
-            }
-            break;
+PNG_STATIC void ConvIndexed4(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *pPal, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x+=2) {
+        c = *s++;
+        pPal = &pDraw->pPalette[(c >> 4) * 3];
+        usPixel = (pPal[2] >> 3); // blue
+        usPixel |= ((pPal[1] >> 2) << 5); // green
+        usPixel |= ((pPal[0] >> 3) << 11); // red
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+        pPal = &pDraw->pPalette[(c & 0xf) * 3];
+        usPixel = (pPal[2] >> 3); // blue
+        usPixel |= ((pPal[1] >> 2) << 5); // green
+        usPixel |= ((pPal[0] >> 3) << 11); // red
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+    }
+} /* ConvIndexed4() */
+
+PNG_STATIC void ConvIndexed2(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x, j;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c, *pPal, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x+=4) {
+        c = *s++;
+        for (j=0; j<4; j++) { // work on pairs of bits
+            pPal = &pDraw->pPalette[(c >> 6) * 3];
+            usPixel = (pPal[2] >> 3); // blue
+            usPixel |= ((pPal[1] >> 2) << 5); // green
+            usPixel |= ((pPal[0] >> 3) << 11); // red
+            if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+                usPixel = __builtin_bswap16(usPixel);
+            *pDest++ = usPixel;
+            c <<= 2;
+        }
+    }
+} /* ConvIndexed2() */
+
+PNG_STATIC void ConvIndexed1(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t c = 0, *pPal, *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        if ((x & 7) == 0) {
+            c = *s++;
+        }
+        pPal = &pDraw->pPalette[(c >> 7) * 3];
+        usPixel = (pPal[2] >> 3); // blue
+        usPixel |= ((pPal[1] >> 2) << 5); // green
+        usPixel |= ((pPal[0] >> 3) << 11); // red
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+        c <<= 1;
+    }
+} /* ConvIndexed1() */
+
+#ifdef PNG_DEMO_FMT
+//
+// Demo of a one-entry format extension: a pseudo pixel format
+// "inverted 8-bit grayscale" (not a real PNG color type; the decoder's
+// header parser would reject it, this exists only to demonstrate that
+// adding a format = one conversion function + one descriptor).
+//
+#define PNG_PIXEL_GRAY8_INVERTED 0x21
+PNG_STATIC void ConvGray8Inverted(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int x;
+    uint16_t usPixel, *pDest = pPixels;
+    uint8_t *s = pDraw->pPixels;
+    (void)u32Bkgd;
+    for (x=0; x<pDraw->iWidth; x++) {
+        usPixel = usGrayTo565[255 - *s++];
+        if (iEndianness == PNG_RGB565_BIG_ENDIAN)
+            usPixel = __builtin_bswap16(usPixel);
+        *pDest++ = usPixel;
+    }
+} /* ConvGray8Inverted() */
+#endif // PNG_DEMO_FMT
+
+//
+// The pixel format descriptor table. Dispatch key = (pixel type, bpp,
+// fast-palette modifier); the remaining fields describe the format.
+//
+PNG_STATIC const PNG_FMT_DESC s_PNGFmtDescs[] = {
+    // pixel type              bpp  ch  flags                            conversion function
+    {PNG_PIXEL_GRAYSCALE,       1,  1, 0,                               ConvGray1},
+    {PNG_PIXEL_GRAYSCALE,       2,  1, 0,                               ConvGray2},
+    {PNG_PIXEL_GRAYSCALE,       4,  1, 0,                               ConvGray4},
+    {PNG_PIXEL_GRAYSCALE,       8,  1, 0,                               ConvGray8},
+    {PNG_PIXEL_TRUECOLOR,       8,  3, 0,                               ConvTrueColor},
+    {PNG_PIXEL_GRAY_ALPHA,      8,  2, PNG_FMT_ALPHA,                   ConvGrayAlpha},
+    {PNG_PIXEL_TRUECOLOR_ALPHA, 8,  4, PNG_FMT_ALPHA,                   ConvTrueColorAlpha},
+    {PNG_PIXEL_INDEXED,         1,  1, PNG_FMT_PALETTE,                 ConvIndexed1},
+    {PNG_PIXEL_INDEXED,         2,  1, PNG_FMT_PALETTE,                 ConvIndexed2},
+    {PNG_PIXEL_INDEXED,         4,  1, PNG_FMT_PALETTE,                 ConvIndexed4},
+    {PNG_PIXEL_INDEXED,         8,  1, PNG_FMT_PALETTE,                 ConvIndexed8},
+    {PNG_PIXEL_INDEXED,         1,  1, PNG_FMT_PALETTE|PNG_FMT_FASTPAL, ConvIndexed1Fast},
+    {PNG_PIXEL_INDEXED,         2,  1, PNG_FMT_PALETTE|PNG_FMT_FASTPAL, ConvIndexed2Fast},
+    {PNG_PIXEL_INDEXED,         4,  1, PNG_FMT_PALETTE|PNG_FMT_FASTPAL, ConvIndexed4Fast},
+    {PNG_PIXEL_INDEXED,         8,  1, PNG_FMT_PALETTE|PNG_FMT_FASTPAL, ConvIndexed8Fast},
+#ifdef PNG_DEMO_FMT
+    {PNG_PIXEL_GRAY8_INVERTED,  8,  1, 0,                               ConvGray8Inverted},
+#endif // PNG_DEMO_FMT
+    {0, 0, 0, 0, NULL} // end of table
+};
+//
+// Convert a line of native PNG pixels into RGB565 by dispatching through
+// the format descriptor table.
+//
+PNG_STATIC void PNGRGB565(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
+{
+    int i, iFast;
+    // 1-entry cache: the format doesn't change between lines of an image,
+    // so the table scan below normally runs only once per decode
+    static const PNG_FMT_DESC *pLastDesc;
+    // Palette images decoded with the PNG_FAST_PALETTE option (and without
+    // alpha) select the PNG_FMT_FASTPAL variant of their format
+    iFast = (pDraw->iPixelType == PNG_PIXEL_INDEXED &&
+             pDraw->pFastPalette != NULL && !pDraw->iHasAlpha);
+    if (pLastDesc != NULL &&
+        pLastDesc->ucPixelType == pDraw->iPixelType &&
+        pLastDesc->ucBpp == pDraw->iBpp &&
+        ((pLastDesc->ucFlags & PNG_FMT_FASTPAL) != 0) == iFast) {
+        (*pLastDesc->pfnConvert)(pDraw, pPixels, iEndianness, u32Bkgd);
+        return;
+    }
+    for (i = 0; s_PNGFmtDescs[i].pfnConvert != NULL; i++) {
+        const PNG_FMT_DESC *pDesc = &s_PNGFmtDescs[i];
+        if (pDesc->ucPixelType == pDraw->iPixelType &&
+            pDesc->ucBpp == pDraw->iBpp &&
+            ((pDesc->ucFlags & PNG_FMT_FASTPAL) != 0) == iFast) {
+            pLastDesc = pDesc;
+            (*pDesc->pfnConvert)(pDraw, pPixels, iEndianness, u32Bkgd);
+            return;
+        }
     }
 } /* PNGRGB565() */
 //

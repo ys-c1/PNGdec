@@ -209,7 +209,7 @@ int PNG::decode(void *pUser, int iOptions)
 //
 void PNG::getLineAsRGB565(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd)
 {
-    PNGRGB565(pDraw, pPixels, iEndianness, u32Bkgd, hasAlpha());
+    PNGRGB565(pDraw, pPixels, iEndianness, u32Bkgd);
 } /* getLineAsRGB565() */
 
 uint8_t PNG::getAlphaMask(PNGDRAW *pDraw, uint8_t *pMask, uint8_t ucThreshold)
